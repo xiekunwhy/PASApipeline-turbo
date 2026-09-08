@@ -79,7 +79,9 @@ main: {
 
         print STDERR "// processing $scaff\n";
 
-        my $genome_seq = $genome_seqs{$scaff} or die "Error, no seq for $scaff";
+        ## reference to the hash slot: avoid copying a whole chromosome sequence
+        my $genome_seq_ref = \($genome_seqs{$scaff});
+        die "Error, no seq for $scaff" unless (defined $$genome_seq_ref);
 
 		my $genes_href = $genome_trans_to_coords{$scaff};
 
@@ -101,7 +103,7 @@ main: {
 				
 				$gene_obj->populate_gene_object($coords_href, $coords_href);
 			
-                my $cdna_seq = $gene_obj->create_cDNA_sequence(\$genome_seq);
+                my $cdna_seq = $gene_obj->create_cDNA_sequence($genome_seq_ref);
 				
 				print ">$trans_id $gene_id\n$cdna_seq\n";
 			}

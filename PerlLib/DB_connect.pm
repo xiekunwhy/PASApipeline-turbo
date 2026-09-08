@@ -81,8 +81,15 @@ sub connect_to_db {
     
     my $dbproc = new DB_connect(); ## temporary fix to deal with lost connections
     $dbproc->{dbh} = $dbh;
-    
-    if ($dbh->{Driver}->{Name} ne 'SQLite') {
+
+    if ($dbh->{Driver}->{Name} eq 'SQLite') {
+        ## PASA sqlite dbs are scratch (rebuilt each run), so favor speed over durability.
+        ## Defaults (journal=DELETE, synchronous=FULL) fsync every commit and are very slow.
+        $dbh->do("PRAGMA journal_mode=MEMORY");
+        $dbh->do("PRAGMA synchronous=OFF");
+        $dbh->do("PRAGMA temp_store=MEMORY");
+        $dbh->do("PRAGMA cache_size=-1000000");  # up to ~1GB page cache per connection
+    } else {
         $dbproc->{__server} = $server;
         $dbproc->{__db} = $db;
         $dbproc->{__username} = $username;

@@ -245,12 +245,13 @@ foreach my $result (@results) {
     
 
     if ($alt_splice_flag) {
-        ## ensure model identifier is unique.
+        ## ensure model identifier is unique; deterministic naming (no time
+        ## suffix) so re-runs produce identical identifiers.
         my $model_incrementer = ++$model_counter{$gene_id};
-		my $tentative_model_name = $gene_obj->{Model_feat_name} . ".$model_incrementer." . sprintf("%x", time());
+		my $tentative_model_name = $gene_obj->{Model_feat_name} . ".$model_incrementer";
 		while ($prev_model_ids{$tentative_model_name}) {
 		  $model_incrementer = ++$model_counter{$gene_id};
-		  $tentative_model_name = $gene_obj->{Model_feat_name} . ".$model_incrementer" . sprintf("%x", time());;
+		  $tentative_model_name = $gene_obj->{Model_feat_name} . ".$model_incrementer";
 		}
 		$model_id = $gene_obj->{Model_feat_name} = $tentative_model_name;
 		$note = "$model_id, alt-splice addition, valid-$is_valid";

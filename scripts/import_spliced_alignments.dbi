@@ -305,13 +305,9 @@ sub process_match_list {
     $alignment->set_spliced_orientation($orient);
     $alignment->set_orientation($orient);
     
-    my $align_id = &load_alignment($alignment);
-    
     my $avg_per_id = sprintf ("%.2f", $sum_per_id / $alignment_length * 100);
-    
-    my $query = qq { update align_link set avg_per_id = ? where align_id = $align_id };
 
-    &RunMod($dbproc, $query, $avg_per_id);
+    my $align_id = &load_alignment($alignment, $avg_per_id);
     
 
 
@@ -320,12 +316,12 @@ sub process_match_list {
 
 ####
 sub load_alignment {
-    my ($alignment) = @_;
-    
+    my ($alignment, $avg_per_id) = @_;
+
     #print "Loading: " . $alignment->get_acc() . " " . $alignment->toToken() . "\n";
-    
-    
-    my $align_id = &Ath1_cdnas::load_CDNA_alignment_obj($dbproc, $alignment, $aligner, undef);
+
+
+    my $align_id = &Ath1_cdnas::load_CDNA_alignment_obj($dbproc, $alignment, $aligner, undef, $avg_per_id);
     
     return ($align_id);
     

@@ -69,6 +69,10 @@ my $DEBUG = $opt_d;
 
 my ($dbproc) = &DB_connect::connect_to_db($MYSQLserver,$MYSQLdb,$user,$password);
 
+## purge previous subcluster data; these two tables are populated only by
+## this loader, so purging makes a re-run idempotent instead of duplicating.
+&RunMod($dbproc, "delete from subcluster_link");
+&RunMod($dbproc, "delete from subclusters");
 
 my $cluster;
 while (<STDIN>) {

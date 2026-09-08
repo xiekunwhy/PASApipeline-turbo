@@ -98,8 +98,8 @@ sub get_seq {
         lock $LOCKVAR;
     
         my $file_pos = $self->{acc_to_pos_index}->{$acc} or confess "Error, no seek pos for acc: $acc";
-        
-        my $fh = $self->refresh_fh();
+
+        my $fh = $self->{fh} || $self->refresh_fh();  # reuse the open handle when possible
         seek($fh, $file_pos, 0);
 
         print STDERR "seeking $acc -> $file_pos\n" if $DEBUG;

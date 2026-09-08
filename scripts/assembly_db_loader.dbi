@@ -39,9 +39,16 @@ if ($opt_h) {die $usage;}
 
 
 my $MYSQLdb = $opt_M or die $usage;
-my $MYSQLserver = &Pasa_conf::getParam("MYSQLSERVER"); 
+my $MYSQLserver = &Pasa_conf::getParam("MYSQLSERVER");
 my $user = &Pasa_conf::getParam("MYSQL_RW_USER");
 my $password = &Pasa_conf::getParam("MYSQL_RW_PASSWORD");
+
+## tag assembly IDs with the db (chromosome) name so that per-chromosome
+## assemblies stay unique when merged genome-wide: asmbl_Chr1_1, ...
+my $db_tag = $MYSQLdb;
+$db_tag =~ s{.*/}{};      # basename
+$db_tag =~ s{\..*$}{};    # strip extension (ie. Chr1.polishing_PASA.sqlite -> Chr1)
+$db_tag =~ s/\W/_/g;
 
 my $DEBUG = $opt_d;
 
@@ -116,7 +123,7 @@ foreach my $persobjfile (@assembly_files) {
         my $result = &first_result_sql($dbproc, $query, $max_align_id);
         my $cdna_acc = $result->[0];
         
-        if ($cdna_acc =~ /asmbl_(\d+)/) {
+        if ($cdna_acc =~ /asmbl_(?:\S+_)?(\d+)$/) {
             $asmbl = $1;
         }
     }
@@ -144,7 +151,7 @@ foreach my $persobjfile (@assembly_files) {
         
         my @cdnas = split (/$DELIMETER/, $cdnaacc);
         my $cluster_id = $assembly->{cluster_id};
-        my $asmbl_identifier = "asmbl_$asmbl";
+        my $asmbl_identifier = "asmbl_${db_tag}_$asmbl";
         print "// assembly $asmbl_identifier in cluster: $cluster_id\n@cdnas\n" . $assembly->toToken() . "\n\n\n";
         
         ## insert asmbl_link

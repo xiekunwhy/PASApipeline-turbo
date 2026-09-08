@@ -40,7 +40,9 @@ BEGIN {
 }
 
 
-use lib ("$ENV{PASAHOME}/PerlLib/", $ENV{PASAHOME});
+## The tree's own PerlLib must come first: when PASAHOME points to another
+## installation (e.g. a conda env), its PerlLib would otherwise shadow ours.
+use lib ("$FindBin::Bin/../PerlLib", "$ENV{PASAHOME}/PerlLib/", $ENV{PASAHOME});
 use Pasa_conf;
 
 1;

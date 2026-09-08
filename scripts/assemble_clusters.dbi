@@ -82,9 +82,13 @@ my $NUM_THREADS = $opt_T || 2;
 my $fasta_retriever = new Fasta_retriever($genomic_seq_db);
 
 
-## check for 'pasa' binary
+## check for 'pasa' binary (PATH first, then the bundled one in this tree)
 my $pasa = `which pasa`;
-unless ($pasa =~ /\w/) {
+$pasa =~ s/\s//g;
+unless ($pasa && -x $pasa) {
+    $pasa = "$FindBin::Bin/../bin/pasa";
+}
+unless ($pasa && -x $pasa) {
     die "Error, cannot locate pasa binary. ";
 }
 
@@ -124,20 +128,50 @@ main: {
         push (@asmbl_ids, $result_aref->[0]);
     }
     
-    my $thread_helper = new Thread_helper($NUM_THREADS);
-    
-    foreach my $asmbl_id (@asmbl_ids) {
-        
-        if ($contigs_already_processed{$asmbl_id}) {
-            next;
-        }
-                        
-        my $thread = threads->create('assemble_transcripts_on_scaffold', $asmbl_id);
-        
-        $thread_helper->add_thread($thread);
-
+    ## Each worker thread keeps its own copy of the genome sequence in memory;
+    ## cap concurrency by genome size so big chromosomes don't blow up RAM.
+    my $genome_bytes = -s $genomic_seq_db;
+    my $max_concurrent = $NUM_THREADS;
+    if ($genome_bytes) {
+        my $by_mem = int(8000000000 / $genome_bytes) || 1;
+        $max_concurrent = $by_mem if ($by_mem < $max_concurrent);
     }
-    
+
+    my $thread_helper = new Thread_helper($max_concurrent);
+
+    foreach my $asmbl_id (@asmbl_ids) {
+
+        ## parallelize at the cluster level; one thread per asmbl_id is
+        ## effectively serial when the db holds a single chromosome.
+        my @cluster_ids = Ath1_cdnas::get_cluster_ids_via_annotdb_asmbl_id($dbproc, $asmbl_id);
+        next unless (@cluster_ids);
+
+        my $nchunks = $max_concurrent * 4;
+        $nchunks = scalar(@cluster_ids) if (@cluster_ids < $nchunks);
+        my $chunk_size = int((scalar(@cluster_ids) + $nchunks - 1) / $nchunks);
+
+        for (my $chunk = 0; $chunk < $nchunks; $chunk++) {
+            my $beg = $chunk * $chunk_size;
+            my $end = $beg + $chunk_size - 1;
+            $end = $#cluster_ids if ($end > $#cluster_ids);
+            my @chunk_cluster_ids = @cluster_ids[$beg..$end];
+
+            my $file_tag = $asmbl_id;
+            $file_tag =~ s/\W/_/g;
+            $file_tag .= ".part$chunk";
+
+            if ($contigs_already_processed{$file_tag}) {
+                next;
+            }
+
+            $thread_helper->wait_for_open_thread();
+
+            my $thread = threads->create('assemble_transcripts_on_scaffold', $asmbl_id, $file_tag, \@chunk_cluster_ids);
+
+            $thread_helper->add_thread($thread);
+        }
+    }
+
     $thread_helper->wait_for_all_threads_to_complete();
     
     $dbproc->disconnect;
@@ -158,19 +192,19 @@ main: {
 
 ####
 sub assemble_transcripts_on_scaffold {
-    my ($asmbl_id) = @_;
-    
+    my ($asmbl_id, $file_tag, $cluster_ids_aref) = @_;
+
     my ($dbproc) = &DB_connect::connect_to_db($MYSQLserver,$MYSQLdb,$user,$password); # refresh it per thread
 
     my @all_assemblies;
     my $sequence = $fasta_retriever->get_seq($asmbl_id); #&Ath1_cdnas::get_seq_from_fasta ($asmbl_id, $genomic_seq_db);
-    
-    ## Get clusters based on that chromo
-    my @cluster_ids = Ath1_cdnas::get_cluster_ids_via_annotdb_asmbl_id($dbproc, $asmbl_id);
-    
+
+    ## Clusters to assemble in this chunk
+    my @cluster_ids = @$cluster_ids_aref;
+
     foreach my $cluster_id (@cluster_ids) {
-        
-        print "\n\n// cluster: $cluster_id\n";
+
+        print "\n\n// cluster: $cluster_id\n" if $SEE;
         my $assembler;
         if ($USE_SPLICE_GRAPH_ASSEMBLER) {
             $assembler = new CDNA::Splice_graph_assembler();
@@ -178,71 +212,70 @@ sub assemble_transcripts_on_scaffold {
         else {
             $assembler = new CDNA::PASA_alignment_assembler();
         }
-        
+
         ## get the cdnas on that cluster
 
         ## refreshen db connection (sometimes assembly takes way tooo long and mysql server goes away)
         $dbproc = &DB_connect::reconnect_to_server($dbproc);
-        
+
         my $query = "select al.align_acc, al.align_id, al.lend, al.score from align_link al where al.cluster_id = $cluster_id and al.validate = 1";
         my @results = &DB_connect::do_sql_2D ($dbproc, $query);
 
         if (scalar @results > $max_num_aligns_assemble_per_cluster) {
 
             print STDERR "Note: have " . scalar(@results) . " alignments in cluster_id: " . $cluster_id . "; Sampling $max_num_aligns_assemble_per_cluster to assemble.\n";
-                        
+
             @results = &select_aligns_to_assemble(\@results, $max_num_aligns_assemble_per_cluster);
-            
+
         }
-        
+
         my @alignments;
         foreach my $result (@results) {
             my ($cdna_acc, $align_id, $align_lend, $score) = @$result;
-            print "cdna_acc: $cdna_acc\talign_id: $align_id\n";
-            
+            print "cdna_acc: $cdna_acc\talign_id: $align_id\n" if $SEE;
+
             my $alignment_obj = &Ath1_cdnas::create_alignment_obj($dbproc, $align_id, \$sequence);
             $alignment_obj->set_acc($cdna_acc);
             my $aligned_orient = $alignment_obj->get_orientation();
             my $spliced_orient = $alignment_obj->get_spliced_orientation();
-            print "$cdna_acc (a$aligned_orient, s$spliced_orient)\n";
+            print "$cdna_acc (a$aligned_orient, s$spliced_orient)\n" if $SEE;
             unless ($aligned_orient =~ /[\+\-]/) {
                 die "Error, $cdna_acc lacs aligned orient!";
             }
-            
-            print $alignment_obj->toToken() . "\n";
+
+            print $alignment_obj->toToken() . "\n" if $SEE;
             push (@alignments, $alignment_obj);
         }
-        
+
         if (@alignments) {
             $assembler->assemble_alignments(@alignments);
-            print $assembler->toAlignIllustration(150);
-            print "\n\n\n";
+            if ($SEE) {
+                print $assembler->toAlignIllustration(150);
+                print "\n\n\n";
+            }
             my @assemblies = $assembler->get_assemblies();
             push (@all_assemblies, @assemblies);
             foreach my $assembly (@assemblies) {
                 my $acc = $assembly->get_acc();
-                print "ASSEMBLY: " . $assembly->toToken() . "\t$acc\n";
+                print "ASSEMBLY: " . $assembly->toToken() . "\t$acc\n" if $SEE;
                 $assembly->{cluster_id} = $cluster_id;
             }
         } else {
-            print "Sorry, no validating cDNA alignments in this cluster.\n";
+            print "Sorry, no validating cDNA alignments in this cluster.\n" if $SEE;
         }
-        
-    }
-    
 
-    my $asmbl_id_for_filename = $asmbl_id;
-    $asmbl_id_for_filename =~ s/\W/_/g;
-    
-    nstore (\@all_assemblies, "assemblies/${asmbl_id_for_filename}.assemblies");
-    
-    open (my $ofh, ">assemblies/${asmbl_id_for_filename}.assemblies.described") or die $!;
+    }
+
+
+    nstore (\@all_assemblies, "assemblies/${file_tag}.assemblies");
+
+    open (my $ofh, ">assemblies/${file_tag}.assemblies.described") or die $!;
     foreach my $assembly (@all_assemblies) {
         my $acc = $assembly->get_acc();
         print $ofh $acc . "\t" . $assembly->toToken() . "\n";
     }
     close $ofh;
-    
+
     return;
 }
 

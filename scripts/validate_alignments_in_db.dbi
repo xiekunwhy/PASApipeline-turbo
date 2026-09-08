@@ -122,16 +122,10 @@ my $genomic_seq_db = $opt_g or die $usage;
 unless (-s $genomic_seq_db) {
     die "Error, cannot find $genomic_seq_db";
 }
-unless (-s "$genomic_seq_db.cidx") {
-    system "cdbfasta -C $genomic_seq_db";
-}
 
 my $transcript_db = $opt_t;
 unless (-s $transcript_db) {
     die "Error, cannot find transcript_db: $transcript_db";
-}
-unless (-s "$transcript_db.cidx") {
-    system "cdbfasta -C $transcript_db";
 }
 
 
@@ -197,23 +191,60 @@ my @files;
 my $total_number_of_results = scalar(@results);
 my $results_processed = int(0);
 
+## Each worker thread keeps its own copy of the (single-chromosome) genome
+## sequence in memory, so cap the per-asmbl thread count by genome size.
+my $genome_bytes = -s $genomic_seq_db;
+my $MAX_SEQ_BYTES = 8_000_000_000;
+my $max_threads_per_asmbl = $CPU;
+if ($genome_bytes) {
+    my $by_mem = int($MAX_SEQ_BYTES / $genome_bytes) || 1;
+    $max_threads_per_asmbl = $by_mem if ($by_mem < $max_threads_per_asmbl);
+}
+
 foreach my $result (@results) {
-    
+
     my $asmbl_id = $result->[0];
     my $asmbl_id_for_filename = $asmbl_id;
     $asmbl_id_for_filename =~ s/\W/_/g;
 
-    my $validations_file = "$tmp_dir/$asmbl_id_for_filename.alignment_validations.txt";
-    push (@files, $validations_file);
-    
-    $thread_helper->wait_for_open_thread();
-    
-    my $thread = threads->create('validate_alignments_on_asmbl_id', $asmbl_id, $validations_file);
-    $thread_helper->add_thread($thread);
+    ## Fetch all alignments pending validation for this asmbl here in the main
+    ## thread, then chunk them across workers.  (One thread per asmbl_id is
+    ## effectively serial when the db holds a single chromosome.)
+    my $query = "select al.align_id, al.prog, ci.length "
+      . "from align_link al, "
+      . "cdna_info ci, "
+      . "clusters c "
+      . "where c.annotdb_asmbl_id = ? and c.cluster_id = al.cluster_id and al.cdna_info_id = ci.id "
+      . " and al.validate is null";
+
+    if ($prog_type) {
+        $query .= " and al.prog = '$prog_type' ";
+    }
+
+    my @alns = &DB_connect::do_sql_2D($dbproc, $query, $asmbl_id);
+    next unless (@alns);
+
+    my $nchunks = @alns < $max_threads_per_asmbl ? scalar(@alns) : $max_threads_per_asmbl;
+    my $chunk_size = int((scalar(@alns) + $nchunks - 1) / $nchunks);
+
+    for (my $chunk = 0; $chunk < $nchunks; $chunk++) {
+        my $beg = $chunk * $chunk_size;
+        my $end = $beg + $chunk_size - 1;
+        $end = $#alns if ($end > $#alns);
+        my @chunk_alns = @alns[$beg..$end];
+
+        my $validations_file = "$tmp_dir/$asmbl_id_for_filename.part$chunk.alignment_validations.txt";
+        push (@files, $validations_file);
+
+        $thread_helper->wait_for_open_thread();
+
+        my $thread = threads->create('validate_alignments_on_asmbl_id', $asmbl_id, $validations_file, \@chunk_alns);
+        $thread_helper->add_thread($thread);
+    }
 
     $results_processed += 1;
     print STDERR "\rProcessing ".$results_processed.'/'.$total_number_of_results."      ";
-    
+
 }
 
 $thread_helper->wait_for_all_threads_to_complete();
@@ -245,12 +276,12 @@ exit(0);
 
 ####
 sub validate_alignments_on_asmbl_id {
-    my ($asmbl_id, $validations_outfile) = @_;
-    
-    
+    my ($asmbl_id, $validations_outfile, $alns_aref) = @_;
+
+
     my $validations_checkpoint_file = "$validations_outfile.ok";
     if (-e $validations_outfile && -e $validations_checkpoint_file) {
-        print STDERR "WARNING, already processed $asmbl_id, skipping and reusing its earlier output.\n";
+        print STDERR "WARNING, already processed $asmbl_id chunk ($validations_outfile), skipping and reusing its earlier output.\n";
         return;
     }
 
@@ -258,43 +289,24 @@ sub validate_alignments_on_asmbl_id {
     $trans_fasta_retriever->refresh_fh(); # each thread gets a new filehandle since can't be shared.
     $genome_fasta_retriever->refresh_fh();
 
-    
+
     print STDERR "\t($asmbl_id)                      ";
-    
+
     open (my $ofh, ">$validations_outfile") or die "Error, cannot write to file: $validations_outfile";
     print $ofh $header;
-    
+
 
     # my $sequence = &Ath1_cdnas::get_seq_from_fasta($asmbl_id, $genomic_seq_db);
 
     my $sequence = uc $genome_fasta_retriever->get_seq($asmbl_id);
-    
+
     my ($dbproc) = &DB_connect::connect_to_db($MYSQLserver,$MYSQLdb,$user,$password);
 
-    
-    ## Get the align ids linked to this asmbl_id:
-    #my $query = "select cdl.align_id, cl.length from cdna_link cdl, cluster_link cl, clusters c where c.annotdb_asmbl_id = ? and c.cluster_id = cl.cluster_id and cl.cdna_acc = cdl.cdna_acc and cdl.prog = ? and cdl.validate is null";
-	# force query to use indexes since sometimes it doesn't want to for some weird unknown reason.   (Thanks Bing-Bing Wang!)
-	my $query = "select al.align_id, al.prog, ci.length "
-	  . "from align_link al, "
-	  . "cdna_info ci, "
-	  . "clusters c "
-	  . "where c.annotdb_asmbl_id = ? and c.cluster_id = al.cluster_id and al.cdna_info_id = ci.id "
-      . " and al.validate is null";
-	  
-    if ($prog_type) {
-        $query .= " and al.prog = '$prog_type' ";
-    }
-	
-    my @results = &DB_connect::do_sql_2D($dbproc, $query, $asmbl_id);
-
-
-	
-    foreach my $result (@results) {
-        my ($align_id, $prog, $cdna_length) = @$result;
+    foreach my $aln (@$alns_aref) {
+        my ($align_id, $prog, $cdna_length) = @$aln;
         print "align_id: $align_id\n" if $SEE;
         my $alignment = &Ath1_cdnas::create_alignment_obj($dbproc, $align_id, \$sequence);
-        
+
         &process_alignment($alignment, $prog, $cdna_length, $asmbl_id, \$sequence, $ofh);
     }
 
@@ -302,7 +314,7 @@ sub validate_alignments_on_asmbl_id {
 
 
     system("touch \'$validations_checkpoint_file\'");
-    
+
     return;
 
 }

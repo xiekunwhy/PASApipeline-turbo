@@ -211,13 +211,17 @@ my %MERGED_MODELS; #cache the model names for those that are merged based on FL-
 my %validating_FL_cdnas; #cache the accession for those FL-cDNAs that validate properly.
 
 
-my $NOVEL_GENE_COUNTER = 0; ## provides unique gene IDs for novel genes.
-share($NOVEL_GENE_COUNTER);
+## Per-contig novel gene/model counters.  File-scope lexicals are cloned per
+## worker thread, so numbering is thread-local: deterministic within a contig
+## and stable across re-runs (no time() suffix anywhere).
+my %NOVEL_GENE_COUNTER;
 
 my %NOVEL_GENE_ID_via_ACC; ## remember the id's given to novel genes when used in subsequent stitching rounds by nonFL assemblies.
 
-my $NOVEL_MODEL_COUNTER = 0;
-share($NOVEL_MODEL_COUNTER);
+my %NOVEL_MODEL_COUNTER;
+
+my $current_contig; ## thread-local: contig under analysis in this thread
+my $MULTI_CONTIG = 0; ## set in main when the db holds more than one contig
 
 my %NOVEL_SPLICE_converted_antisense; #for those 'novel' FL assemblies deemed antisense, must convert alt-splices of these to antisense as well.
 my %ANTISENSE_ACCS; #track those classified as antisense.
@@ -281,7 +285,14 @@ foreach my $result_aref (@results) {
     $status_descr{$status_id} = $descr;
 }
 
-my $NOVEL_GENE_TOKEN = sprintf("%x", time());
+## Novel-gene IDs must be unique across per-chromosome (per-db) runs and
+## stable across re-runs: use the db/chromosome tag only, no time() suffix
+## (e.g. novel_gene_15_Chr1, novel_model_27_Chr1).
+my $db_tag = $MYSQLdb;
+$db_tag =~ s{.*/}{};      # basename
+$db_tag =~ s{\..*$}{};    # strip extension (ie. Chr1.polishing_PASA.sqlite -> Chr1)
+$db_tag =~ s/\W/_/g;
+my $NOVEL_GENE_TOKEN = $db_tag;
 
 
 main: {
@@ -295,6 +306,7 @@ main: {
     
     my @results = &DB_connect::do_sql_2D($dbproc, $query);
     my $num_contigs = $#results + 1;
+    $MULTI_CONTIG = ($num_contigs > 1) ? 1 : 0;
     
     my $thread_helper = new Thread_helper($CPU);
 
@@ -357,6 +369,8 @@ main: {
 ####
 sub process_contig {
     my ($asmbl_id) = @_;
+
+    $current_contig = $asmbl_id; # thread-local copy, used for deterministic novel-gene naming
 
     my ($dbproc_t) = &DB_connect::connect_to_db($MYSQLserver,$MYSQLdb,$user,$password);
     
@@ -823,11 +837,13 @@ sub improve_annotations_using_flcdnas {
         #########################################
         
         if (@$validating_fl_wrappers_aref) {
-            {
-                lock($NOVEL_GENE_COUNTER);
-                $NOVEL_GENE_COUNTER++;
-            }
-            my $temp_novel_gene_ID = "novel_gene_${NOVEL_GENE_COUNTER}_${NOVEL_GENE_TOKEN}";
+
+            $NOVEL_GENE_COUNTER{$current_contig}++;
+            my $gene_ctr = $NOVEL_GENE_COUNTER{$current_contig};
+            my $id_tag = ($MULTI_CONTIG) ? "${NOVEL_GENE_TOKEN}_${current_contig}" : $NOVEL_GENE_TOKEN;
+            $id_tag =~ s/\W/_/g;
+
+            my $temp_novel_gene_ID = "novel_gene_${gene_ctr}_${id_tag}";
             my $rest_alt_splice_flag = 0;
             foreach my $assembly_wrapper (@$validating_fl_wrappers_aref) {
                 
@@ -841,12 +857,10 @@ sub improve_annotations_using_flcdnas {
                 $assembly_wrapper->{is_novel} = 1;
                 $assembly_wrapper->{is_valid} = 1;
                 
-                {
-                    lock($NOVEL_MODEL_COUNTER);
-                    $NOVEL_MODEL_COUNTER++;
-                }
-                
-                my $temp_novel_model_id = "novel_model_${NOVEL_MODEL_COUNTER}_${NOVEL_GENE_TOKEN}" ;
+                $NOVEL_MODEL_COUNTER{$current_contig}++;
+                my $model_ctr = $NOVEL_MODEL_COUNTER{$current_contig};
+
+                my $temp_novel_model_id = "novel_model_${model_ctr}_${id_tag}" ;
                 $assembly_wrapper->{annotated_model_identifier} = $temp_novel_model_id;
                 
                 if (! $rest_alt_splice_flag) {
@@ -1150,12 +1164,12 @@ sub summarize_asmbl_status {
 
 ####
 sub compare_updated_proteins {
-    print "Method: compare_updated_proteins()\n";
+    print "Method: compare_updated_proteins()\n" if $SEE;
     my ($old_gene, $new_gene, $seq_ref, $FL_alt_splice_flag) = @_;
     $old_gene->create_all_sequence_types($seq_ref);
     $new_gene->create_all_sequence_types($seq_ref);
     
-    print "old_gene: " . $old_gene->toString(noSeqs=>1) . "new_gene: " . $new_gene->toString(noSeqs=>1) . "\n";
+    print "old_gene: " . $old_gene->toString(noSeqs=>1) . "new_gene: " . $new_gene->toString(noSeqs=>1) . "\n" if $SEE;
     
     my $old_protein_seq = $old_gene->{protein_seq};
     my $old_protein_length = $old_gene->{protein_seq_length};
@@ -1164,7 +1178,7 @@ sub compare_updated_proteins {
     
     
     
-    print "Protein lengths: old($old_protein_length), new($new_protein_length)\n";
+    print "Protein lengths: old($old_protein_length), new($new_protein_length)\n" if $SEE;
     
     
     unless ($old_protein_seq && $new_protein_seq) {
@@ -1190,7 +1204,7 @@ sub compare_updated_proteins {
         ## align the two together.
         my ($per_id, $overlap) = &perform_fasta_align($old_protein_seq, $new_protein_seq);
         ## use original length, not shorter one.  Use diff variable for this length
-        print "FastaAlign: $per_id percent ID across $overlap aa.\n";
+        print "FastaAlign: $per_id percent ID across $overlap aa.\n" if $SEE;
         my $shorter_protein_length = ($new_protein_length < $old_protein_length) ? $new_protein_length : $old_protein_length;
         my $percent_overlap = $overlap/$shorter_protein_length*100;
         if ($per_id < $MIN_PERID_PROT_COMPARE || $percent_overlap < $MIN_PERCENT_ALIGN_LENGTH) {
@@ -1201,7 +1215,7 @@ sub compare_updated_proteins {
             $comment = "Passed validation test.  Aligns with $per_id % ID across $percent_overlap % of the shorter  protein length.\n";
         }
     }
-    print "Comparison results: Valid: $valid\tComment: $comment\n";
+    print "Comparison results: Valid: $valid\tComment: $comment\n" if $SEE;
     return ($valid, $comment);
 }
 
@@ -1242,10 +1256,10 @@ sub get_update_id {
     
     
     if ($updated_structure) {
-        print "Got updated structure.  Cloning it.\n";
+        print "Got updated structure.  Cloning it.\n" if $SEE;
         my $protein_seq = $updated_structure->get_protein_sequence();
-        print "$gene_id, $model_id, updated protein: $protein_seq\n";
-        print $updated_structure->toString(noSeqs=>1);
+        print "$gene_id, $model_id, updated protein: $protein_seq\n" if $SEE;
+        print $updated_structure->toString(noSeqs=>1) if $SEE;
         my $cloned_gene_obj = $updated_structure->clone_gene(); #scalar attributes with long values (>200 chars) are lost.
         # retain the protein sequence.
         $cloned_gene_obj->{protein_seq} = $protein_seq;
@@ -1598,7 +1612,7 @@ sub get_alignment_assemblies_via_subcluster_id {
     my $assembler = new CDNA::PASA_alignment_assembler;
     $assembler->{incoming_alignments} = [@alignment_objs];
     $assembler->{assemblies} = [@alignment_objs];
-    print $assembler->toAlignIllustration();
+    print $assembler->toAlignIllustration() if $SEE;
     
     ## Wrap each alignment assembly for use here.
     foreach my $assembly (@alignment_objs) {
@@ -1793,7 +1807,7 @@ sub get_alignment_segment_coords_from_alignment {
     my @seg_coords;
     
     my @segments = $alignment->get_alignment_segments();
-    print $alignment->toString();
+    print $alignment->toString() if $SEE;
     
     foreach my $segment (@segments) {
         my ($seg_lend, $seg_rend) = $segment->get_coords();
@@ -1923,11 +1937,11 @@ sub associate_annotated_gene_models_to_FL_alignments {
             print "Assembling annotated gene with cDNA-based gene.\n";
             my $assembler = new CDNA::Gene_obj_alignment_assembler($seq_ref);
             $assembler->assemble_genes($annotated_gene_model, $align_gene_obj);
-            print $assembler->toAlignIllustration();
+            print $assembler->toAlignIllustration() if $SEE;
             
             my @assemblies = $assembler->get_assemblies();
             foreach my $assembly (@assemblies) {
-                print $assembly->toToken() . " " . $assembly->get_acc() . "\n";
+                print $assembly->toToken() . " " . $assembly->get_acc() . "\n" if $SEE;
             }
             my $num_assemblies = $#assemblies + 1;
             if ($num_assemblies == 1) {
@@ -2286,10 +2300,10 @@ sub incorporate_compatible_nonFL_alignments_into_gene_annotations {
             ## Check assembly alignment compatibility with the annotated gene
             my $assembler = new CDNA::PASA_alignment_assembler($seq_ref);
             $assembler->assemble_alignments($gene_alignment, $alignment);
-            print $assembler->toAlignIllustration();
+            print $assembler->toAlignIllustration() if $SEE;
             my @assemblies = $assembler->get_assemblies();
             foreach my $assembly (@assemblies) {
-                print $assembly->toToken() . " " . $assembly->get_acc() . "\n";
+                print $assembly->toToken() . " " . $assembly->get_acc() . "\n" if $SEE;
             }
             my $num_assemblies = scalar (@assemblies);
             
@@ -2490,7 +2504,7 @@ sub incorporate_incompatible_nonFL_alignments_via_stitching {
                     }
                     my $assembler = new CDNA::PASA_alignment_assembler($seq_ref);
                     $assembler->assemble_alignments(@alignments);
-                    print $assembler->toAlignIllustration();
+                    print $assembler->toAlignIllustration() if $SEE;
                     my @assemblies = $assembler->get_assemblies();
                     if ($#assemblies > 0) { #multiple assemblies
                         ## A valid gene model, but inconsistent with currently set of updates already applied here.
@@ -3306,14 +3320,12 @@ sub set_status_to_split_gene { ## Should join this function with the status upda
         &RunMod($dbproc, $query, $new_status_id, $comment, $status_link_id);
         
         if ($valid_update && $cdna_counter > 1) {
-            
-            lock($NOVEL_GENE_COUNTER);
-            $NOVEL_GENE_COUNTER++;
-            $gene_id = "split_gene_${original_gene_id}-g${NOVEL_GENE_COUNTER}";
-            
-            lock($NOVEL_MODEL_COUNTER);
-            $NOVEL_MODEL_COUNTER++;
-            $annotated_model_feat_name = "split_gene_${original_gene_id}-${original_model_feat_name}-m${NOVEL_MODEL_COUNTER}";
+
+            $NOVEL_GENE_COUNTER{$current_contig}++;
+            $gene_id = "split_gene_${original_gene_id}-g" . $NOVEL_GENE_COUNTER{$current_contig};
+
+            $NOVEL_MODEL_COUNTER{$current_contig}++;
+            $annotated_model_feat_name = "split_gene_${original_gene_id}-${original_model_feat_name}-m" . $NOVEL_MODEL_COUNTER{$current_contig};
             $is_novel_flag = 1;
         }
         

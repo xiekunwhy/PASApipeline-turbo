@@ -95,6 +95,28 @@ print STDERR "Will process $alignment_cluster_number alignment assemblies...\n";
 $dbproc->{dbh}->{AutoCommit} = 0;
 my $progress = 0;
 
+## Prefetch align_id and coordinate span per accession in bulk
+## (replaces two per-accession SQL round-trips).
+my %acc_to_align_id;
+{
+    my $query = "select align_acc, min(align_id) from align_link";
+    $query .= " where validate = 1" if ($require_valid);
+    $query .= " group by align_acc";
+    my @results = &do_sql_2D($dbproc, $query);
+    foreach my $result (@results) {
+        $acc_to_align_id{$result->[0]} = $result->[1];
+    }
+}
+my %align_span;
+{
+    my $query = "select align_id, min(lend), max(rend) from alignment group by align_id";
+    my @results = &do_sql_2D($dbproc, $query);
+    foreach my $result (@results) {
+        $align_span{$result->[0]} = [$result->[1], $result->[2]];
+    }
+}
+print STDERR "// done prefetching alignment spans.\n";
+
 foreach my $asmbl_id_info (keys %asmbl_id_to_cdna_accs) {
     
 	my ($asmbl_id, $spliced_orient) = split(/;/, $asmbl_id_info);
@@ -108,20 +130,20 @@ foreach my $asmbl_id_info (keys %asmbl_id_to_cdna_accs) {
 	my %acc_to_struct;
 
     foreach my $cdna_acc (@cdna_accs) {
-        my $align_id = &get_align_id($cdna_acc);
-        if ($align_id) {
-            my ($lend, $rend) = sort {$a<=>$b} &get_alignment_span($align_id);
-			
+        my $align_id = $acc_to_align_id{$cdna_acc};
+        if ($align_id && $align_span{$align_id}) {
+            my ($lend, $rend) = @{$align_span{$align_id}};
+
 			my $struct = { cdna_acc => $cdna_acc,
 						   lend => $lend,
 						   rend => $rend,
 					   };
-			
+
 
 			push (@transcripts, $struct);
-			
+
 			$acc_to_struct{$cdna_acc} = $struct;
-			
+
 
 		}
     }
@@ -164,7 +186,7 @@ foreach my $asmbl_id_info (keys %asmbl_id_to_cdna_accs) {
         
         for (my $i = 0; $i < $#transcript_pile; $i++) {
 
-            print "\r[$i of $#transcript_pile]   ";            
+            print "\r[$i of $#transcript_pile]   " if ($i % 1000 == 0);
             
             my $trans_i = $transcript_pile[$i];
             my $i_acc = $trans_i->{cdna_acc};
@@ -237,13 +259,14 @@ foreach my $asmbl_id_info (keys %asmbl_id_to_cdna_accs) {
 
     $progress++;
     if ($progress % 50 == 0){
-        print STDERR "Committed $progress/$alignment_cluster_number ...\r";
-        $dbproc->{dbh}->commit;
+        print STDERR "Processed $progress/$alignment_cluster_number ...\r";
     }
     
     
 }
 
+## single commit at the end: an interrupted run rolls back cleanly
+## (periodic commits would leave a half-reassigned cluster table).
 $dbproc->{dbh}->commit;
 print STDERR "\nDone!\n";
 

@@ -23,10 +23,13 @@ use strict;
 use CDNA::CDNA_alignment;
 use Data::Dumper;
 use Carp;
+use FindBin;
 
 ## File scoped globals:
 my $DELIMETER = "$;,";
 our $FUZZLENGTH = 20;
+our $PASA_BIN; ## resolve the pasa binary only once per process
+my $TMP_COUNTER = 0;
 
 
 =item new()
@@ -60,13 +63,24 @@ sub _init {
     $self->{assemblies} = []; #contains list of all singletons and assemblies.
     $self->{fuzzlength} = $FUZZLENGTH;  #default setting.
     
-    my $pasa_bin = `which pasa`;
-    $pasa_bin =~ s/\s//g;
-    
-    unless (-x $pasa_bin) {
-        confess "Error, pasa binary [$pasa_bin] isn't executable or couldn't be found.";
+    my $pasa_bin = $PASA_BIN;
+    unless ($pasa_bin) {
+        $pasa_bin = `which pasa`;
+        $pasa_bin =~ s/\s//g;
+
+        unless ($pasa_bin && -x $pasa_bin) {
+            ## fall back to the binary bundled in this PASA tree,
+            ## independent of PATH/`which` quirks in batch-job environments.
+            my $bundled = "$FindBin::Bin/../bin/pasa";
+            $pasa_bin = $bundled if (-x $bundled);
+        }
+
+        unless ($pasa_bin && -x $pasa_bin) {
+            confess "Error, pasa binary [$pasa_bin] isn't executable or couldn't be found.";
+        }
+        $PASA_BIN = $pasa_bin;
     }
-    
+
     $self->{pasa_bin} = $pasa_bin;
 
 }
@@ -212,8 +226,10 @@ sub pasa_cpp_assemblies {
     my $sequence_ref;
     my $incoming_alignments_aref = $self->{incoming_alignments};
     # create input file for pasa-cpp implementation:
-    srand();
-    my $uniq_token = time() . "-" . rand();
+    ## collision-free temp file token: pid + thread id + counter
+    my $thread_id = ($INC{'threads.pm'}) ? threads->tid() : 0;
+    $TMP_COUNTER++;
+    my $uniq_token = "$$-$thread_id-$TMP_COUNTER";
     
     my $tmpdir = $ENV{TMPDIR};
     unless ($tmpdir) {

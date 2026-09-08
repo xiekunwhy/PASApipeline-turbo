@@ -497,35 +497,52 @@ sub get_asmbl_gene_obj {
 
 ####
 sub load_CDNA_alignment_obj {
-    my ($dbproc, $alignment, $prog, $validate) = @_;
-    
+    my ($dbproc, $alignment, $prog, $validate, $avg_per_id) = @_;
+
     my @segments = $alignment->get_alignment_segments();
     my $num_segments = $#segments + 1;
-        
-    
-    ## insert row in cdna_link
-    my $query = "insert into align_link (align_acc, cdna_info_id, prog, validate, aligned_orient, spliced_orient, num_segments) values (?,?,?,?,?,?,?)";
-    &RunMod($dbproc, 
-            $query, 
+
+    my $dbh = $dbproc->{dbh};
+
+    ## prepare the insert statements once per connection instead of per row
+    if (defined $avg_per_id) {
+        my $sth = $dbproc->{__sth_insert_align_link_avg} ||= $dbh->prepare(
+            "insert into align_link (align_acc, cdna_info_id, prog, validate, aligned_orient, spliced_orient, num_segments, avg_per_id) values (?,?,?,?,?,?,?,?)");
+        $sth->execute(
             $alignment->get_acc(),
             $alignment->get_cdna_id(),
-            $prog, 
-            $validate, 
-            $alignment->get_aligned_orientation(), 
-            $alignment->get_spliced_orientation(), 
+            $prog,
+            $validate,
+            $alignment->get_aligned_orientation(),
+            $alignment->get_spliced_orientation(),
+            $num_segments,
+            $avg_per_id,
+            );
+    } else {
+        my $sth = $dbproc->{__sth_insert_align_link} ||= $dbh->prepare(
+            "insert into align_link (align_acc, cdna_info_id, prog, validate, aligned_orient, spliced_orient, num_segments) values (?,?,?,?,?,?,?)");
+        $sth->execute(
+            $alignment->get_acc(),
+            $alignment->get_cdna_id(),
+            $prog,
+            $validate,
+            $alignment->get_aligned_orientation(),
+            $alignment->get_spliced_orientation(),
             $num_segments,
             );
-    
-    my $align_id = &DB_connect::get_last_insert_id($dbproc);
-        
+    }
+
+    my $align_id = $dbh->last_insert_id(undef, undef, undef, undef);
+
+    my $sth_aln = $dbproc->{__sth_insert_alignment} ||= $dbh->prepare(
+        "insert into alignment (align_id, lend, rend, mlend, mrend, orient, per_id) values (?,?,?,?,?,?,?)");
+    my $orient = $alignment->get_aligned_orientation();
     foreach my $segment (@segments) {
         my ($lend, $rend) = sort {$a<=>$b} $segment->get_coords();
         my ($mlend, $mrend) = sort {$a<=>$b} $segment->get_mcoords();
-        my $query = "insert into alignment (align_id, lend, rend, mlend, mrend, orient, per_id) values (?,?,?,?,?,?,?)";
-        &RunMod($dbproc, $query, $align_id, $lend, $rend, $mlend, $mrend, $alignment->get_aligned_orientation(), $segment->get_per_id());
-        
+        $sth_aln->execute($align_id, $lend, $rend, $mlend, $mrend, $orient, $segment->get_per_id());
     }
-    
+
     return ($align_id);
 }
 

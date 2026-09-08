@@ -133,17 +133,22 @@ foreach my $result (@results) {
         }
         my @alignment_objs;
         foreach my $align_id (@assemblies) {
-                        
+
             my $alignment_obj = Ath1_cdnas::create_alignment_obj($dbproc, $align_id, $seq_ref);
 
             push (@alignment_objs, $alignment_obj);
         }
-        
-        print "# Incoming assemblies:\n";
-        my $assembler = new CDNA::Genome_based_cDNA_assembler;
-        $assembler->{incoming_alignments} = [@alignment_objs];
-        $assembler->{assemblies} = [@alignment_objs];
-        print $assembler->toAlignIllustration();
+
+        ## sort by coordinate so the pairwise loop below can terminate early
+        @alignment_objs = sort { my ($al) = $a->get_coords(); my ($bl) = $b->get_coords(); $al <=> $bl } @alignment_objs;
+
+        if ($SEE) {
+            print "# Incoming assemblies:\n";
+            my $assembler = new CDNA::Genome_based_cDNA_assembler;
+            $assembler->{incoming_alignments} = [@alignment_objs];
+            $assembler->{assemblies} = [@alignment_objs];
+            print $assembler->toAlignIllustration();
+        }
         
         my @assembly_clusters; #contains refs to lists of alignment objs.
         if ($#alignment_objs > 0) { #multiple assemblies in cluster
@@ -161,12 +166,15 @@ foreach my $result (@results) {
                     my ($jlend, $jrend) = $jalign->get_coords();
                     my $j_numsegs = $jalign->get_num_segments();
                     my $j_spliced_orientation = $jalign->get_spliced_orientation();
-                    
+
+                    ## sorted by lend: no further overlap possible for this i
+                    last if ($jlend >= $irend);
+
                     ## check for compatible spliced orientations.
                     unless ($i_spliced_orientation eq $j_spliced_orientation) {
                         next; #must have same spliced orientation
                     }
-                    
+
                     ## make sure overlap via coordinates:
                     unless ($ilend < $jrend && $irend > $jlend) {
                         next; #don't overlap
@@ -194,12 +202,12 @@ foreach my $result (@results) {
                 my @elements = @$cluster;
                 foreach my $element (@elements) {
                     $incluster{$element} = 1;
-                    print "$element in cluster\n";
+                    print "$element in cluster\n" if $SEE;
                 }
             }
             for (my $i = 0; $i <= $#alignment_objs; $i++) {
                 unless ($incluster{$i}) {
-                    print "adding $i to cluster listings.\n";
+                    print "adding $i to cluster listings.\n" if $SEE;
                     push (@clusters, [$i]);
                 }
             }
