@@ -487,7 +487,7 @@ sub get_updated_gene_obj {
     my $query = "select after_gene_obj from annotation_updates where model_id = ? and is_valid = 1 and alt_splice_flag = 0 and have_after = 1 and compare_id = ?";
     if (wantarray()) {
         my @blobs;
-        my @results = &do_sql_2D($dbproc, $query, $model_feat_name, $compare_id);
+        my @results = &DB_connect::do_sql_2D_prepared($dbproc, $query, $model_feat_name, $compare_id);
         foreach my $result (@results) {
             my $blob = $result->[0];
             if ($blob) {
@@ -496,8 +496,9 @@ sub get_updated_gene_obj {
         }
         return (@blobs);
     }
-    
-    my $blob = &very_first_result_sql($dbproc, $query, $model_feat_name, $compare_id);
+
+    my @results = &DB_connect::do_sql_2D_prepared($dbproc, $query, $model_feat_name, $compare_id);
+    my $blob = (@results) ? $results[0]->[0] : undef;
     return ($blob);
 }
 
@@ -579,7 +580,8 @@ sub get_gene_objs_via_gene_id {
 sub get_gene_obj_via_model_id {
     my ($dbproc, $model_id, $annot_version) = @_;
     my $query = "select gene_obj from annotation_store where model_id = ? and annotation_version = ?";
-    my $gene_obj = thaw(&very_first_result_sql($dbproc, $query, $model_id, $annot_version));
+    my @results = &DB_connect::do_sql_2D_prepared($dbproc, $query, $model_id, $annot_version);
+    my $gene_obj = thaw(@results ? $results[0]->[0] : undef);
     return ($gene_obj);
 }
 

@@ -384,6 +384,15 @@ sub process_contig {
     $current_contig = $asmbl_id; # thread-local copy, used for deterministic novel-gene naming
 
     my ($dbproc_t) = &DB_connect::connect_to_db($MYSQLserver,$MYSQLdb,$user,$password);
+
+    ## Wrap the whole contig's comparison writes in one transaction:
+    ## per-statement autocommit costs real time at ~100k statements/contig,
+    ## and a failure rolls back cleanly (the run dies on thread failure anyway).
+    my $in_transaction = 0;
+    if ($dbproc_t->{dbh}->{Driver}->{Name} eq 'SQLite') {
+        $dbproc_t->{dbh}->begin_work;
+        $in_transaction = 1;
+    }
     
     my $contig_id = $asmbl_id; #should probably use contig_id rather than asmbl_id (our database field)
     print "## Processing contig: $asmbl_id\n";
@@ -511,8 +520,12 @@ sub process_contig {
     
     ## Gene Splitting:
     &analyze_potential_gene_splitting($dbproc_t, $contig_id, \%using_as_nonFL_assembly, $seq_ref);
-    
-    
+
+
+    if ($in_transaction) {
+        $dbproc_t->{dbh}->commit;
+    }
+
     return;
     
 } # endof foreach contig
@@ -1091,6 +1104,11 @@ sub summarize_asmbl_status {
     my ($dbproc, $assembly_wrappers_aref, $seq_ref) = @_;
     my (@assembly_wrappers) = @$assembly_wrappers_aref;
     my %existing_model_feat_to_update_id; #remember the ones which won't change in this run:
+
+    ## collect rows; flushed as batched multi-row inserts after the loop
+    my @status_link_rows;
+    my @annotation_link_rows;
+
     foreach my $assembly_wrapper (@assembly_wrappers) {
         my $alignment = $assembly_wrapper->{alignmentObj};
         my $acc = $alignment->get_acc();
@@ -1129,18 +1147,9 @@ sub summarize_asmbl_status {
         print "Update_id: $update_id\n";
         
         ## Load into the mysql database
-        
-        ## insert status_link
-        my $fields = "cdna_acc, status_id, is_chromo, compare_id, annot_update_id";
-        my $values = "?,?,?,?,?";
-        my @params = ($acc, $status, 1, $compare_id, $update_id);
-        if ($comment) {
-            $fields .= ",comment";
-            $values .= ",?";
-            push (@params, $comment);
-        }
-        my $query = "insert into status_link ($fields) values ($values)";
-        &DB_connect::RunMod($dbproc, $query, @params);
+
+        ## status_link row (batched; comment column always present, NULL when empty)
+        push (@status_link_rows, [$acc, $status, 1, $compare_id, $update_id, ($comment ? $comment : undef)]);
         
         
         ## Annotated gene model IDs 
@@ -1150,26 +1159,46 @@ sub summarize_asmbl_status {
         ##    now have to take some additional effort.  Eventually, must rework the code so it's done more consistently.
         
         
-        ## insert annotation_link
+        ## annotation_link rows (batched)
         my @TUs = split (/\s+/, $overlapping_gene_text); #when multiple genes are listed, no models are examined.
         if ($#TUs > 0) { #multiple genes matched:
             foreach my $tu (@TUs) {
                 my $model = $Gene_to_model_list{$tu}->[0];
-                my $query = "insert into annotation_link (cdna_acc, gene_id, model_id, compare_id) values (?,?,?,?)";
-                &DB_connect::RunMod($dbproc, $query, $acc, $tu, $model, $compare_id);
+                push (@annotation_link_rows, [$acc, $tu, $model, $compare_id]);
             }
         } else { #only one gene, load gene and model:
-            
+
             unless ($matching_gene_model_feat_name) {
                 ## none assigned.  Give one for some reference.
                 $matching_gene_model_feat_name = $Gene_to_model_list{$overlapping_gene_text}->[0];
             }
-            
-            my $query = "insert into annotation_link (cdna_acc, gene_id, model_id, compare_id) values (?,?,?,?)";
-            &DB_connect::RunMod($dbproc, $query, $acc, $overlapping_gene_text, $matching_gene_model_feat_name, $compare_id);
+
+            push (@annotation_link_rows, [$acc, $overlapping_gene_text, $matching_gene_model_feat_name, $compare_id]);
         }
-        
+
     }
+
+    &flush_batched_inserts($dbproc, "status_link", "cdna_acc, status_id, is_chromo, compare_id, annot_update_id, comment", \@status_link_rows);
+    &flush_batched_inserts($dbproc, "annotation_link", "cdna_acc, gene_id, model_id, compare_id", \@annotation_link_rows);
+}
+
+
+####
+## Multi-row INSERT in chunks (SQLite's SQLITE_MAX_VARIABLE_NUMBER is 999).
+sub flush_batched_inserts {
+    my ($dbproc, $table, $cols, $rows_aref) = @_;
+
+    return unless (@$rows_aref);
+
+    my $ncols = scalar(@{$rows_aref->[0]});
+    my $per_insert = 150; # 150 rows x 6 cols = 900 vars < 999
+    while (@$rows_aref) {
+        my @chunk = splice(@$rows_aref, 0, $per_insert);
+        my $query = "insert into $table ($cols) values "
+            . join(",", ("(" . join(",", ("?") x $ncols) . ")") x scalar(@chunk));
+        &DB_connect::RunMod_prepared($dbproc, $query, map { @$_ } @chunk);
+    }
+    return;
 }
 
 
@@ -1289,24 +1318,25 @@ sub get_update_id {
     ## Several accessions may be built into the same maximally updated structure.  Only store one entry for this update.
     if (($is_valid_flag) && (!$alt_splice_flag) && (!$is_novel_flag)) {
         my $query = "select update_id from annotation_updates where gene_id = ? and model_id = ? and is_valid = ? and alt_splice_flag = ? and is_novel_flag = ? and compare_id = ?";
-        $update_id = &DB_connect::very_first_result_sql ($dbproc, $query, $gene_id, $matching_gene_model_feat_name, 1, 0, 0, $compare_id);
+        my @results = &DB_connect::do_sql_2D_prepared($dbproc, $query, $gene_id, $matching_gene_model_feat_name, 1, 0, 0, $compare_id);
+        $update_id = (@results) ? $results[0]->[0] : undef;
         if ($update_id) {
-            
+
             ## Update the latest updated gene structure:
             print "Got update_id: $update_id (already exists), now updating the after-gene-obj structure to this one.\n";
             my $query = "update annotation_updates set after_gene_obj = ? where update_id = ?";
-            &DB_connect::RunMod($dbproc, $query, $after_gene_obj, $update_id);
+            &DB_connect::RunMod_prepared($dbproc, $query, $after_gene_obj, $update_id);
             &invalidate_gene_exon_cache($gene_id);
 
             return ($update_id);
         }
-    } 
-    
+    }
+
     ## Insert new entry
     print "Inserting new entry in annotation_updates; getting an update_id for it.\n";
     my $query = "insert into annotation_updates (gene_id, model_id, alt_splice_flag, before_gene_obj, after_gene_obj, compare_id, is_valid, have_before, have_after, is_novel_flag) values (?,?,?,?,?,?,?,?,?,?)";
     print "BLOB Length: after_gene_obj: " . length ($after_gene_obj);
-    &DB_connect::RunMod($dbproc, $query, $gene_id, $model_id, $alt_splice_flag, undef, $after_gene_obj, $compare_id, $is_valid_flag, 0, 1, $is_novel_flag);
+    &DB_connect::RunMod_prepared($dbproc, $query, $gene_id, $model_id, $alt_splice_flag, undef, $after_gene_obj, $compare_id, $is_valid_flag, 0, 1, $is_novel_flag);
     &invalidate_gene_exon_cache($gene_id);
     
     $update_id = &DB_connect::get_last_insert_id($dbproc);
@@ -1321,7 +1351,7 @@ sub get_latest_gene_models {
     
     ## Get list of working models:
     my $query = "select model_id from annotation_store where gene_id = ? and annotation_version = ?";
-    my @results = &DB_connect::do_sql_2D($dbproc, $query, $TU_feat_name, $annot_version);
+    my @results = &DB_connect::do_sql_2D_prepared($dbproc, $query, $TU_feat_name, $annot_version);
     my @working_models;
     foreach my $result (@results) {
         my ($model) = @$result;
@@ -1764,8 +1794,10 @@ sub validate_FLcdna_inferred_geneObjs {
         print "$cdna_acc, running gene validation tests.\n";
         
         ## reset gene_obj to non-partial status:
-        $gene_obj = $assembly->get_gene_obj_via_alignment(); ## not allowing partials now.
-        $gene_obj->{Model_feat_name} = $cdna_acc; 
+        ## the first get_gene_obj_via_alignment() call above already used
+        ## {'5prime'=>0,'3prime'=>0} which is identical to the default
+        ## (no partials allowed) - reuse that object instead of recomputing
+        ## the ORF (expensive) for the same alignment.
         $gene_obj->set_5prime_partial(0);
         $gene_obj->set_3prime_partial(0);
         $gene_obj->create_all_sequence_types($seq_ref);

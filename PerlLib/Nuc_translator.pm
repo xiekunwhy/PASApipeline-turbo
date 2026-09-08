@@ -99,7 +99,27 @@ B<Returns:> $protein_sequence
 
 
 
+## Translation result caches.  The same CDS/cDNA sequences recur many times
+## within a locus (same gene model compared against many assemblies, ORF
+## scans of identical regions), so memoizing by exact sequence avoids
+## re-running the per-codon loop.  Cleared when the genetic code changes.
+our %TRANSLATE_CACHE;
+our %GET_PROTEIN_CACHE;
+our $TRANSLATE_CACHE_MAX = 200000;
+
 sub translate_sequence {
+    my ($sequence, $frame) = @_;
+    my $key = $frame . "\x00" . $sequence;
+    my $cached = $TRANSLATE_CACHE{$key};
+    return ($cached) if (defined $cached);
+    my $result = &_translate_sequence_uncached($sequence, $frame);
+    if (scalar(keys %TRANSLATE_CACHE) < $TRANSLATE_CACHE_MAX) {
+        $TRANSLATE_CACHE{$key} = $result;
+    }
+    return ($result);
+}
+
+sub _translate_sequence_uncached {
   my ($sequence, $frame) = @_;
     
     $sequence = uc ($sequence);
@@ -164,7 +184,10 @@ B<Returns:> $protein_sequence
 
 sub get_protein {
     my ($sequence) = @_;
-    
+
+    my $cached = $GET_PROTEIN_CACHE{$sequence};
+    return ($cached) if (defined $cached);
+
     ## Assume frame 1 unless multiple stops appear.
     my $least_stops = undef();
     my $least_stop_prot_seq = "";
@@ -172,6 +195,9 @@ sub get_protein {
         my $protein = &translate_sequence($sequence, $forward_frame);
         my $num_stops = &count_stops_in_prot_seq($protein);
         if ($num_stops == 0) {
+            if (scalar(keys %GET_PROTEIN_CACHE) < $TRANSLATE_CACHE_MAX) {
+                $GET_PROTEIN_CACHE{$sequence} = $protein;
+            }
             return ($protein);
         } else {
             if (!defined($least_stops)) {
@@ -185,6 +211,9 @@ sub get_protein {
                 #keeping original $num_stops and $least_stop_prot_seq
             }
         }
+    }
+    if (scalar(keys %GET_PROTEIN_CACHE) < $TRANSLATE_CACHE_MAX) {
+        $GET_PROTEIN_CACHE{$sequence} = $least_stop_prot_seq;
     }
     return ($least_stop_prot_seq);
 }
@@ -237,6 +266,8 @@ sub use_specified_genetic_code {
         die "Sorry, $special_code is not currently supported or recognized.\n";
     }
     &$init_codon_table_subref(); ## Restore default universal code.  Others are variations on this.
+    %TRANSLATE_CACHE = ();
+    %GET_PROTEIN_CACHE = ();
     $currentCode = $special_code;
     
     if ($special_code eq "Euplotes") {

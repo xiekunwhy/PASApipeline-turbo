@@ -271,6 +271,53 @@ sub get_last_insert_id {
     return (&very_first_result_sql($dbproc, $query));
 }
 
+
+####
+## Prepared-statement variants for hot paths: prepare once per connection,
+## execute many times.  Same global lock + error handling as RunMod/do_sql_2D.
+sub prepare_sth {
+    my ($dbproc, $query) = @_;
+    my $cache = $dbproc->{__prep_cache} ||= {};
+    my $sth = $cache->{$query};
+    unless ($sth) {
+        $sth = $cache->{$query} = $dbproc->{dbh}->prepare($query);
+        unless ($sth) {
+            confess "Cannot prepare statement: $query: $DBI::errstr\n";
+        }
+    }
+    return ($sth);
+}
+
+sub RunMod_prepared {
+    my ($dbproc, $query, @values) = @_;
+    my $sth = &prepare_sth($dbproc, $query);
+    eval {
+        lock $LOCKVAR;
+        $sth->execute(@values);
+    };
+    if ($@) {
+        confess "failed query: <$query>\tvalues: @values\nErrors: $DBI::errstr\n";
+    }
+    return;
+}
+
+sub do_sql_2D_prepared {
+    my ($dbproc, $query, @values) = @_;
+    my $sth = &prepare_sth($dbproc, $query);
+    my @results;
+    eval {
+        lock $LOCKVAR;
+        $sth->execute(@values);
+        while (my @row = $sth->fetchrow_array()) {
+            push (@results, [@row]);
+        }
+    };
+    if ($@) {
+        confess "failed query: <$query>\tvalues: @values\nErrors: $DBI::errstr\n";
+    }
+    return (@results);
+}
+
 sub delete_table {
     my ($dbproc, $table) = @_;
 

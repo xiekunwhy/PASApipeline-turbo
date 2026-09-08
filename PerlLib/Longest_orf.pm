@@ -250,7 +250,19 @@ sub get_orfs {
     
     foreach my $start_pos (@{$starts_ref}) {
 		my $start_pos_frame = $start_pos % 3;
-		foreach my $stop_pos (@{$stops_ref}) {
+
+		## binary search: first stop > $start_pos (stops are ascending).
+		## Equivalent to scanning @$stops_ref from the beginning, but skips
+		## the O(#stops) prefix that can never match (stop must be > start).
+		my $lo = 0;
+		my $hi = $#$stops_ref;
+		while ($lo <= $hi) {
+			my $mid = ($lo + $hi) >> 1;
+			if ($stops_ref->[$mid] <= $start_pos) { $lo = $mid + 1; }
+			else { $hi = $mid - 1; }
+		}
+		for (my $si = $lo; $si <= $#$stops_ref; $si++) {
+			my $stop_pos = $stops_ref->[$si];
 		  # print "Comparing start: $start_pos to stop: $stop_pos, $direction\n";
 		  if ( ($stop_pos > $start_pos)   && #end3 > end5
 				 ( ($stop_pos - $start_pos) % 3 == 0) #must be in-frame
