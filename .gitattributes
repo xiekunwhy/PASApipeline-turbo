@@ -1,0 +1,3 @@
+# Normalize all text files to LF on every platform (this codebase runs on
+# Linux; CRLF in checked-out files breaks shebang execution of .dbi scripts).
+* text=auto eol=lf
