@@ -22,6 +22,15 @@ We routinely update EVM gene models with PASA on large plant genomes, using a ch
 - **Sorted pairwise loop with early break** in `subcluster_builder.dbi` (avoids O(k^2) blowups on giant clusters).
 - Hot-path debug prints are now guarded behind verbose flags in `assemble_clusters.dbi`, `cDNA_annotation_comparer.dbi` and `subcluster_builder.dbi` (removes hundreds of MB of log I/O per chromosome).
 
+### Performance, round 2 (assembly + annotation-comparison cores)
+
+- **Bulk alignment loading** (`PerlLib/Ath1_cdnas.pm`, used by `assemble_clusters.dbi`, `subcluster_builder.dbi` and `cDNA_annotation_comparer.dbi`): `create_alignment_objs_bulk()` / `get_alignment_objs_via_align_accs()` build all alignment objects of a cluster/subcluster with one SQL query per 500 alignments instead of two/three queries per alignment. `create_alignment_obj()` keeps its exact behavior through a shared row-to-object builder (verified by mock-DB equivalence tests).
+- **Pure-Perl assembly for 1–2 alignments** (`PerlLib/CDNA/PASA_alignment_assembler.pm`): `pasa_cpp_assemblies()` now computes singleton and pairwise assemblies in-process, mirroring `canMerge()`/`mergeAlignments()` of `pasa_cpp` line by line (span overlap → equal fixed orientation → lockstep segment walk with structural splice-junction flags and fuzzlength=20 → splice-aware merge). This removes two external `pasa` process spawns per pair, the dominant cost of the comparer's per-(gene model × transcript) compatibility checks and of singleton clusters in the assembly step. Set `PASA_NO_PERL_PAIR_ASSEMBLY=1` to fall back to the binary. The `pasa` binary is only required for 3+ alignments now (resolved lazily).
+- **Build subcluster alignment objects once, not twice** (`cDNA_annotation_comparer.dbi`): the FL-mode and nonFL-mode passes share cached alignment objects per subcluster (spliced orientations are restored on reuse so pass two sees freshly-built state). Cache is capped (~300k objects) to bound memory on very large chromosomes.
+- **Exon-overlap checks cached per gene**: `model_overlaps_exon_segment()` no longer re-queries and re-thaws gene models for every candidate overlap; cached exon coordinates are invalidated exactly where `annotation_updates` rows are stored or (in)validated (`get_update_id`, antisense/merge/split status changes).
+- **Sequence computation once per gene object**: `compare_updated_proteins()` skips `create_all_sequence_types()` when the object's protein/cDNA/CDS sequences are already computed (the same annotated model is compared against many assemblies).
+- **Other**: previously-incorporated EST alignments are cached instead of re-fetched per stitching attempt; FL-inferred gene objects in `stitch_nonFL_alignments_into_FL_alignments` are computed once per FL-cDNA instead of per (EST × FL) pair; subcluster listings are cached across the two comparer passes; `DB_connect::get_last_insert_id()` uses the driver-native call instead of an extra SELECT round-trip; `Fasta_retriever::get_seq()` strips whitespace per line while reading instead of a second full pass over chromosome-length strings.
+
 ### Per-chromosome sharding support and unique, stable identifiers
 
 - `assembly_db_loader.dbi`: assembly IDs carry the db (chromosome) tag — `asmbl_Chr1_1` — so per-chromosome assembly files merge without collisions.
@@ -33,6 +42,7 @@ We routinely update EVM gene models with PASA on large plant genomes, using a ch
 - `scripts/Pasa_init.pm`: the tree's own `PerlLib` now takes precedence over `$PASAHOME/PerlLib`, so a conda-provided PASAHOME no longer shadows this installation's modules.
 - Binary discovery falls back to the tree's bundled `bin/pasa` (and `$PASAHOME/bin/fasta`) when `which` fails in batch-job environments.
 - `subcluster_loader.dbi` purges subcluster tables before loading, making re-runs idempotent.
+- **Run-to-run determinism**: cluster IDs, assembly IDs, subcluster IDs and gff3 output order no longer depend on Perl's per-process hash randomization — `assign_clusters_by_stringent_alignment_overlap.dbi` iterates groups in sorted order, `SingleLinkageClusterer` returns members and clusters in deterministic order, `import_spliced_alignments.dbi` assigns `align_id`s in sorted contig order, and the assembly-orientation majority vote in `PASA_alignment_assembler.pm` breaks ties deterministically. Identical inputs now give byte-identical outputs across runs (upstream PASA renumbers clusters/assemblies randomly on every run).
 
 ## Compatibility
 

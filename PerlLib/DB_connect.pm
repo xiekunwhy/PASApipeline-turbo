@@ -264,6 +264,9 @@ sub very_first_result_sql {
 
 sub get_last_insert_id {
     my ($dbproc) = @_;
+    ## use the driver's native call instead of an extra SQL round trip
+    my $id = eval { $dbproc->{dbh}->last_insert_id(undef, undef, undef, undef) };
+    return ($id) if ($id);
     my $query = ($dbproc->{dbh}->{Driver}->{Name} eq 'SQLite') ? 'select last_insert_rowid()' : "select LAST_INSERT_ID()";
     return (&very_first_result_sql($dbproc, $query));
 }

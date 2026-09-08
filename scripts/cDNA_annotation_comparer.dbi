@@ -229,6 +229,17 @@ my %ANTISENSE_ACCS; #track those classified as antisense.
 my %Gene_to_model_list; ## if a model is not directly assigned to a failed update, assign one based on a gene entry.
 
 
+## Performance caches.  These are file-scope lexicals, hence cloned per worker
+## thread; each contig is processed by a single thread, so they are effectively
+## per-contig and thread-safe.
+my %subcluster_align_objs_cache;     ## subcluster_id => {objs=>[...], orig_spliced_orient=>{acc=>orient}}; shared across the FL/nonFL passes
+my $subcluster_align_objs_cache_size = 0; ## approx. number of cached alignment objects
+my $SUBCLUSTER_ALIGN_OBJS_CACHE_MAX = 300000; ## beyond this, subclusters are rebuilt (bulk) instead of cached
+my %subclusters_from_clusters_cache; ## cluster_id => [subcluster_id, ...]
+my %gene_exon_coords_cache;          ## gene feat_name => [[lend,rend],...]; invalidated when a model update is stored
+my %est_alignment_obj_cache;         ## cdna_acc => alignment obj for read-only reuses
+
+
 unless (defined $MAX_UTR_EXONS) {
     $MAX_UTR_EXONS = 2;
 }
@@ -411,7 +422,7 @@ sub process_contig {
             foreach my $subcluster_id (@subclusters) {
                 print "# Processing subcluster_id: $subcluster_id\n";
                 
-                my ($flcdna_assembly_wrappers_aref, $non_fl_assembly_wrappers_aref) = &get_alignment_assemblies_via_subcluster_id($dbproc_t, $subcluster_id, $seq_ref, \%using_as_nonFL_assembly);
+                my ($flcdna_assembly_wrappers_aref, $non_fl_assembly_wrappers_aref) = &get_alignment_assemblies_via_subcluster_id($dbproc_t, $subcluster_id, $seq_ref, \%using_as_nonFL_assembly, $asmbl_id);
                 
                 
                 ################################################################
@@ -1166,8 +1177,17 @@ sub summarize_asmbl_status {
 sub compare_updated_proteins {
     print "Method: compare_updated_proteins()\n" if $SEE;
     my ($old_gene, $new_gene, $seq_ref, $FL_alt_splice_flag) = @_;
-    $old_gene->create_all_sequence_types($seq_ref);
-    $new_gene->create_all_sequence_types($seq_ref);
+    ## Sequence extraction/translation is deterministic for a given gene
+    ## structure; the same annotated model is compared against many assembly
+    ## wrappers, so compute its sequences only once per object.
+    unless ($old_gene->{pasa_all_seqs_created} && $old_gene->{protein_seq}) {
+        $old_gene->create_all_sequence_types($seq_ref);
+        $old_gene->{pasa_all_seqs_created} = 1;
+    }
+    unless ($new_gene->{pasa_all_seqs_created} && $new_gene->{protein_seq}) {
+        $new_gene->create_all_sequence_types($seq_ref);
+        $new_gene->{pasa_all_seqs_created} = 1;
+    }
     
     print "old_gene: " . $old_gene->toString(noSeqs=>1) . "new_gene: " . $new_gene->toString(noSeqs=>1) . "\n" if $SEE;
     
@@ -1276,7 +1296,8 @@ sub get_update_id {
             print "Got update_id: $update_id (already exists), now updating the after-gene-obj structure to this one.\n";
             my $query = "update annotation_updates set after_gene_obj = ? where update_id = ?";
             &DB_connect::RunMod($dbproc, $query, $after_gene_obj, $update_id);
-	        
+            &invalidate_gene_exon_cache($gene_id);
+
             return ($update_id);
         }
     } 
@@ -1286,6 +1307,7 @@ sub get_update_id {
     my $query = "insert into annotation_updates (gene_id, model_id, alt_splice_flag, before_gene_obj, after_gene_obj, compare_id, is_valid, have_before, have_after, is_novel_flag) values (?,?,?,?,?,?,?,?,?,?)";
     print "BLOB Length: after_gene_obj: " . length ($after_gene_obj);
     &DB_connect::RunMod($dbproc, $query, $gene_id, $model_id, $alt_splice_flag, undef, $after_gene_obj, $compare_id, $is_valid_flag, 0, 1, $is_novel_flag);
+    &invalidate_gene_exon_cache($gene_id);
     
     $update_id = &DB_connect::get_last_insert_id($dbproc);
     print ", UPDATE_ID: $update_id\n";
@@ -1550,7 +1572,12 @@ sub populate_gene_to_model_list {
 ####
 sub get_subclusters_from_clusters {
     my ($dbproc, $cluster_id) = @_;
-    
+
+    ## called once per FL-mode/nonFL-mode pass; cache the listing.
+    if (my $cached = $subclusters_from_clusters_cache{$cluster_id}) {
+        return (@$cached);
+    }
+
     my @subclusters;
     
     my $query = "select subcluster_id from subclusters where cluster_id = $cluster_id order by subcluster_id";
@@ -1575,44 +1602,73 @@ sub get_subclusters_from_clusters {
                                 '?' => 2);  
     
     # order so unknown spliced orientation is analyzed last
-    @subclusters = sort { $rank_analysis_order{ $subcluster_id_to_spliced_orient{$a} } 
-                          <=>  
-                              $rank_analysis_order{ $subcluster_id_to_spliced_orient{$b} } } @subclusters; 
-    
-    
+    @subclusters = sort { $rank_analysis_order{ $subcluster_id_to_spliced_orient{$a} }
+                          <=>
+                              $rank_analysis_order{ $subcluster_id_to_spliced_orient{$b} } } @subclusters;
+
+    $subclusters_from_clusters_cache{$cluster_id} = [@subclusters];
+
     return (@subclusters);
 }
 
 
 ####
 sub get_alignment_assemblies_via_subcluster_id {
-    my ($dbproc, $subcluster_id, $seq_ref, $using_as_nonFL_assembly_href) = @_;
-    
+    my ($dbproc, $subcluster_id, $seq_ref, $using_as_nonFL_assembly_href, $genome_acc) = @_;
+
     my @flcdna_assembly_wrappers;
     my @non_fl_assembly_wrappers;
-    
-    my @assemblies;
-    my $query = "select cdna_acc from subcluster_link where subcluster_id = $subcluster_id";
-    my @results = &DB_connect::do_sql_2D($dbproc, $query);
-    
-    foreach my $result (@results) {
-        push (@assemblies, $result->[0]);
-    }
-    unless (@assemblies) {
-        die "Sorry, no assemblies for subcluster $subcluster_id.\n";
-    }
+
+    ## Build the alignment objects once per subcluster and reuse them for both
+    ## the FL-mode and the nonFL-mode pass.  On reuse, each object's spliced
+    ## orientation is reset to its freshly-built state, because the FL-mode
+    ## pass may have assigned a spliced orientation to '?' alignments
+    ## (validate_FLcdna_inferred_geneObjs) and the nonFL pass must see the
+    ## original values.
     my @alignment_objs;
-    foreach my $assembly (@assemblies) {
-        my $alignment_obj = &Ath1_cdnas::get_alignment_obj_via_align_acc($dbproc, $assembly, $seq_ref);
-        push (@alignment_objs, $alignment_obj);
+    if (my $cache_entry = $subcluster_align_objs_cache{$subcluster_id}) {
+        @alignment_objs = @{$cache_entry->{objs}};
+        foreach my $alignment_obj (@alignment_objs) {
+            my $acc = $alignment_obj->get_acc();
+            my $orig_orient = $cache_entry->{orig_spliced_orient}->{$acc};
+            if ($alignment_obj->get_spliced_orientation() ne $orig_orient) {
+                $alignment_obj->set_spliced_orientation($orig_orient);
+            }
+        }
+    } else {
+        my @assemblies;
+        my $query = "select cdna_acc from subcluster_link where subcluster_id = $subcluster_id";
+        my @results = &DB_connect::do_sql_2D($dbproc, $query);
+
+        foreach my $result (@results) {
+            push (@assemblies, $result->[0]);
+        }
+        unless (@assemblies) {
+            die "Sorry, no assemblies for subcluster $subcluster_id.\n";
+        }
+        ## bulk-load all alignment objects of the subcluster in one query per
+        ## 500 accessions instead of three queries per accession.
+        @alignment_objs = @{ &Ath1_cdnas::get_alignment_objs_via_align_accs($dbproc, \@assemblies, $seq_ref, $genome_acc) };
+
+        my %orig_spliced_orients;
+        foreach my $alignment_obj (@alignment_objs) {
+            $orig_spliced_orients{$alignment_obj->get_acc()} = $alignment_obj->get_spliced_orientation();
+        }
+        if ($subcluster_align_objs_cache_size < $SUBCLUSTER_ALIGN_OBJS_CACHE_MAX) {
+            $subcluster_align_objs_cache{$subcluster_id} = { objs => [@alignment_objs],
+                                                             orig_spliced_orient => \%orig_spliced_orients };
+            $subcluster_align_objs_cache_size += scalar(@alignment_objs);
+        }
     }
-    
+
     ## Illustrate what we have as input:
-    print "# Incoming assemblies:\n";
-    my $assembler = new CDNA::PASA_alignment_assembler;
-    $assembler->{incoming_alignments} = [@alignment_objs];
-    $assembler->{assemblies} = [@alignment_objs];
-    print $assembler->toAlignIllustration() if $SEE;
+    print "# Incoming assemblies:\n" if $SEE;
+    if ($SEE) {
+        my $assembler = new CDNA::PASA_alignment_assembler;
+        $assembler->{incoming_alignments} = [@alignment_objs];
+        $assembler->{assemblies} = [@alignment_objs];
+        print $assembler->toAlignIllustration();
+    }
     
     ## Wrap each alignment assembly for use here.
     foreach my $assembly (@alignment_objs) {
@@ -1623,7 +1679,7 @@ sub get_alignment_assemblies_via_subcluster_id {
             $is_fli = 0;
             $assembly_wrapper->{comment} .= " Using FL-cDNA assembly as a non-FL assembly. ";
         }
-        print "ASMBL: $cdna_acc (fli_status: $is_fli)\n";
+        print "ASMBL: $cdna_acc (fli_status: $is_fli)\n" if $SEE;
         if ($is_fli) {
             push (@flcdna_assembly_wrappers, $assembly_wrapper);
         } else {
@@ -1824,30 +1880,72 @@ sub model_overlaps_exon_segment {
     my ($dbproc, $model_struct, $segment_coords_aref) = @_;
 
     my $feat_name = $model_struct->{feat_name};
-    
-    ## get the gene object from the database:
-    #my $gene_obj = &Ath1_cdnas::get_gene_obj_via_model_id($dbproc, $model_feat_name, $annot_version);
-    
-    my (@model_objs) = &get_latest_gene_models($dbproc, $feat_name);
 
-    foreach my $gene_obj (@model_objs) {
-        
-        foreach my $exon ($gene_obj->get_exons()) {
-            
-            my ($exon_lend, $exon_rend) = sort {$a<=>$b} $exon->get_coords();
-            
-            foreach my $segment_coords (@$segment_coords_aref) {
-                my ($seg_lend, $seg_rend) = sort {$a<=>$b} @$segment_coords;
-                
-                if ($seg_lend <= $exon_rend && $seg_rend >= $exon_lend) {
-                    ## found overlap!
-                    return (1);
-                }
+    ## Exon coordinates per gene are cached; getting the latest gene models
+    ## involves database queries plus thawing gene objects, and this check is
+    ## done for every candidate overlapping gene of every assembly.
+    my $exon_coords_aref = $gene_exon_coords_cache{$feat_name};
+    unless ($exon_coords_aref) {
+        my @exon_coords;
+        my (@model_objs) = &get_latest_gene_models($dbproc, $feat_name);
+        foreach my $gene_obj (@model_objs) {
+            foreach my $exon ($gene_obj->get_exons()) {
+                my ($exon_lend, $exon_rend) = sort {$a<=>$b} $exon->get_coords();
+                push (@exon_coords, [$exon_lend, $exon_rend]);
             }
         }
-        
+        $exon_coords_aref = $gene_exon_coords_cache{$feat_name} = [@exon_coords];
+    }
+
+    foreach my $exon_coords (@$exon_coords_aref) {
+        my ($exon_lend, $exon_rend) = @$exon_coords;
+
+        foreach my $segment_coords (@$segment_coords_aref) {
+            my ($seg_lend, $seg_rend) = sort {$a<=>$b} @$segment_coords;
+
+            if ($seg_lend <= $exon_rend && $seg_rend >= $exon_lend) {
+                ## found overlap!
+                return (1);
+            }
+        }
     }
     return (0); # no overlap
+}
+
+
+####
+## Drop cached exon coordinates for genes whose latest model structures may
+## have changed.  Called wherever annotation_updates rows are stored or
+## (in)validated: get_update_id, set_status_to_antisense,
+## set_status_to_delay_update, set_status_to_split_gene.
+sub invalidate_gene_exon_cache {
+    my (@gene_ids) = @_;
+
+    foreach my $gene_id (@gene_ids) {
+        next unless (defined $gene_id);
+        foreach my $gene (split (/\s+/, $gene_id)) { # multi-gene text possible
+            delete $gene_exon_coords_cache{$gene};
+        }
+    }
+    return;
+}
+
+
+####
+## Cached accessor for alignment objects that are fetched read-only and
+## potentially many times (e.g. the previously-incorporated EST assemblies
+## reloaded for every (assembly x model) stitching compatibility check).
+sub get_alignment_obj_cached {
+    my ($dbproc, $cdna_acc, $seq_ref) = @_;
+
+    my $alignment_obj = $est_alignment_obj_cache{$cdna_acc};
+    unless ($alignment_obj) {
+        $alignment_obj = &Ath1_cdnas::get_alignment_obj_via_align_acc($dbproc, $cdna_acc, $seq_ref);
+        if (scalar(keys %est_alignment_obj_cache) < $SUBCLUSTER_ALIGN_OBJS_CACHE_MAX) {
+            $est_alignment_obj_cache{$cdna_acc} = $alignment_obj;
+        }
+    }
+    return ($alignment_obj);
 }
 
 
@@ -1903,29 +2001,35 @@ sub associate_annotated_gene_models_to_FL_alignments {
     
     
     my %treating_as_nonFL;
-    
+
+    ## Conversion of gene objects to alignment objects is deterministic;
+    ## cache per model and per wrapper instead of reconverting per pair.
+    my $gene_assembler = new CDNA::Gene_obj_alignment_assembler($seq_ref);
+    my %model_alignment_cache;   ## model_feat_name => cdna_alignment
+    my %wrapper_alignment_cache; ## cdna_acc => cdna_alignment
+
     foreach my $annotated_gene_model (@$annotated_gene_models_aref) {
         my $model_feat_name = $annotated_gene_model->{Model_feat_name};
         my $partial_href = &analyze_partial_status($annotated_gene_model);
         my ($gene_lend, $gene_rend) = sort {$a<=>$b} $annotated_gene_model->get_gene_span();
-        
+
         #tracking
         $model_feat_name_to_annotated_gene_obj_href->{$model_feat_name} = $annotated_gene_model;
-        
+
         foreach my $assembly_wrapper (@$validating_fl_wrappers_aref) {
             my $alignment_obj = $assembly_wrapper->{alignmentObj};
             my ($align_lend, $align_rend) = sort {$a<=>$b} $alignment_obj->get_coords();
-            
+
             my $align_gene_obj = $assembly_wrapper->{converted_gene_obj};
             my $cdna_acc = $alignment_obj->get_acc();
             print "Comparing $model_feat_name to $cdna_acc\n";
-            
+
             if ($treating_as_nonFL{$cdna_acc}) {
                 print "already decided to treat $cdna_acc as a non-FL cDNA\n";
                 next;
             }
-            
-            if (my $cdna = $annotated_model_to_alignment_assembly_href->{$model_feat_name}) { 
+
+            if (my $cdna = $annotated_model_to_alignment_assembly_href->{$model_feat_name}) {
                 print "Current gene model ($model_feat_name) already associated with alignment assembly ($cdna).\n";
                 last;
             }
@@ -1933,10 +2037,14 @@ sub associate_annotated_gene_models_to_FL_alignments {
                 print "cDNA assembly ($cdna_acc) already compatible with a gene model ($model).\n";
                 next;
             }
-            
+
             print "Assembling annotated gene with cDNA-based gene.\n";
+            my $model_alignment = $model_alignment_cache{$model_feat_name}
+                ||= $gene_assembler->gene_obj_to_cdna_alignment($annotated_gene_model);
+            my $wrapper_alignment = $wrapper_alignment_cache{$cdna_acc}
+                ||= $gene_assembler->gene_obj_to_cdna_alignment($align_gene_obj);
             my $assembler = new CDNA::Gene_obj_alignment_assembler($seq_ref);
-            $assembler->assemble_genes($annotated_gene_model, $align_gene_obj);
+            $assembler->assemble_alignments($model_alignment, $wrapper_alignment);
             print $assembler->toAlignIllustration() if $SEE;
             
             my @assemblies = $assembler->get_assemblies();
@@ -2499,7 +2607,7 @@ sub incorporate_incompatible_nonFL_alignments_via_stitching {
                     print "-checking to see if still compatible with other already merged EST assemblies.\n";
                     my @alignments = ($stitched_alignment);
                     foreach my $est_acc (@ESTasmblAccs) {
-                        my $alignment = &Ath1_cdnas::get_alignment_obj_via_align_acc($dbproc, $est_acc, $seq_ref);
+                        my $alignment = &get_alignment_obj_cached($dbproc, $est_acc, $seq_ref);
                         push (@alignments, $alignment);
                     }
                     my $assembler = new CDNA::PASA_alignment_assembler($seq_ref);
@@ -2704,18 +2812,26 @@ sub incorporate_incompatible_nonFL_alignments_via_STOMPING {
 sub stitch_nonFL_alignments_into_FL_alignments {
     print "Method: stitch_non_FL_alignments_into_FL_alignments()\n";
     my ($non_fl_assembly_wrappers_aref, $fl_cdnas_for_stitching_aref, $seq_ref) = @_;
-    
+
+    ## The FL-inferred gene objects don't depend on the EST being stitched;
+    ## compute them once instead of per (EST x FL-cDNA) pair.
+    my @fl_gene_objs;
+    foreach my $fl_cdna_wrapper (@$fl_cdnas_for_stitching_aref) {
+        push (@fl_gene_objs, $fl_cdna_wrapper->{alignmentObj}->get_gene_obj_via_alignment());
+    }
+
     foreach my $alignment_wrapper (@$non_fl_assembly_wrappers_aref) {
         my $non_fl_alignment = $alignment_wrapper->{alignmentObj};
         my $est_acc = $non_fl_alignment->get_acc();
-        
+
         ## try each FL-cDNA
-        foreach my $fl_cdna_wrapper (@$fl_cdnas_for_stitching_aref) {
+        for (my $i = 0; $i <= $#$fl_cdnas_for_stitching_aref; $i++) {
+            my $fl_cdna_wrapper = $fl_cdnas_for_stitching_aref->[$i];
             my $fl_alignment = $fl_cdna_wrapper->{alignmentObj};
             my $fl_acc = $fl_alignment->get_acc();
             print "Trying to stitch FL $fl_acc by EST $est_acc\n";
-            
-            my $fl_gene = $fl_alignment->get_gene_obj_via_alignment();
+
+            my $fl_gene = $fl_gene_objs[$i];
             
             my $stitched_alignment = &get_stitched_alignment($fl_alignment, $non_fl_alignment);
             my $stitched_gene_obj = $stitched_alignment->get_gene_obj_via_alignment();
@@ -3055,6 +3171,11 @@ sub set_status_to_delay_update {
         ## change annot update to invalid:
         $query = "update annotation_updates set is_valid = 0 where update_id = $update_id";
         &RunMod($dbproc, $query);
+
+        if ($update_id) {
+            my $updated_gene_id = &DB_connect::very_first_result_sql($dbproc, "select gene_id from annotation_updates where update_id = $update_id");
+            &invalidate_gene_exon_cache($updated_gene_id);
+        }
         
         print "-disabling current incorporation status for $cdna_acc: Status changed from $status_id to $new_status_id\n";
     }
@@ -3187,7 +3308,7 @@ sub analyze_potential_gene_splitting {
                     next;
                 }
                 
-                my $alignment = &Ath1_cdnas::get_alignment_obj_via_align_acc($dbproc, $cdna_acc, $seq_ref);
+                my $alignment = &get_alignment_obj_cached($dbproc, $cdna_acc, $seq_ref);
                 my $alignment_gene_obj = $alignment->get_gene_obj_via_alignment();
                 my ($orf_lend, $orf_rend) = sort {$a<=>$b} $alignment_gene_obj->get_model_span();
                 unless ($orf_lend < $model_rend && $orf_rend > $model_lend) { #overlap
@@ -3297,7 +3418,7 @@ sub set_status_to_split_gene { ## Should join this function with the status upda
 
         $cdna_counter++;
         
-        my $alignment = &Ath1_cdnas::get_alignment_obj_via_align_acc ($dbproc, $cdna_acc, $seq_ref);
+        my $alignment = &get_alignment_obj_cached($dbproc, $cdna_acc, $seq_ref);
         my $gene_obj = $alignment->get_gene_obj_via_alignment(); ## replace current updated gene version with the FL-cDNA inferred gene, over-write any previous inferred update
         ## want to store just the protein sequence as part of gene_obj
         if ($gene_obj->get_CDS_length() != 0) {
@@ -3336,6 +3457,7 @@ sub set_status_to_split_gene { ## Should join this function with the status upda
         ## change annot update to invalid:
         $query = "update annotation_updates set gene_id = ?, model_id = ?, alt_splice_flag = 0, is_valid = $valid_update, is_novel_flag = 1, have_after = 1, after_gene_obj = ? where update_id = $update_id ";
         &RunMod($dbproc, $query, $gene_id, $annotated_model_feat_name, nfreeze($gene_obj));
+        &invalidate_gene_exon_cache($original_gene_id, $gene_id);
     }
 }
 
@@ -3397,7 +3519,7 @@ sub classify_antisense_transcripts {
         
         print "Processing $cdna_acc (FL:$FLCDNA{$cdna_acc}) for potential antisense.\n";
         
-        my $alignment = &Ath1_cdnas::get_alignment_obj_via_align_acc($dbproc, $cdna_acc, $seq_ref);
+        my $alignment = &get_alignment_obj_cached($dbproc, $cdna_acc, $seq_ref);
         my $spliced_orient = $alignment->get_spliced_orientation();
         
         if ($spliced_orient eq "?") {
@@ -3444,6 +3566,13 @@ sub set_status_to_antisense {
     ## Update annotation updates flags:
     $query = "update annotation_updates set is_valid = 0, alt_splice_flag = 0 where update_id = ?";
     &RunMod($dbproc, $query, $update_id);
+
+    ## the update being invalidated may belong to a different gene than the
+    ## antisense targets; drop its exon cache entry too.
+    if ($update_id) {
+        my $updated_gene_id = &DB_connect::very_first_result_sql($dbproc, "select gene_id from annotation_updates where update_id = $update_id");
+        &invalidate_gene_exon_cache($updated_gene_id);
+    }
     
     
     ## Disable any novel alt-splice isoforms based on novel gene:

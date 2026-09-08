@@ -132,11 +132,15 @@ foreach my $result (@results) {
             next;
         }
         my @alignment_objs;
-        foreach my $align_id (@assemblies) {
-
-            my $alignment_obj = Ath1_cdnas::create_alignment_obj($dbproc, $align_id, $seq_ref);
-
-            push (@alignment_objs, $alignment_obj);
+        if (@assemblies) {
+            ## bulk-build all alignment objects of the cluster in one query
+            ## per 500 alignments instead of two queries per alignment.
+            my $objs_href = Ath1_cdnas::create_alignment_objs_bulk($dbproc, \@assemblies, $asmbl_id, $seq_ref);
+            foreach my $align_id (@assemblies) {
+                my $alignment_obj = $objs_href->{$align_id}
+                    or die "Error, no alignment obj built for align_id: $align_id";
+                push (@alignment_objs, $alignment_obj);
+            }
         }
 
         ## sort by coordinate so the pairwise loop below can terminate early

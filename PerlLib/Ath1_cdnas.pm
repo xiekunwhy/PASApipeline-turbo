@@ -42,21 +42,136 @@ sub create_alignment_obj {
     my $dbproc = shift;
     my $align_id = shift;
     my $seq_ref = shift;
-    
-    
-    my $query = "select c.annotdb_asmbl_id from clusters c, align_link al where al.align_id = $align_id and al.cluster_id = c.cluster_id";
-    my $genome_acc = &DB_connect::very_first_result_sql($dbproc, $query);
+    my $genome_acc = shift; ## optional: pass the known contig to skip a query
 
+    unless ($genome_acc) {
+        my $query = "select c.annotdb_asmbl_id from clusters c, align_link al where al.align_id = $align_id and al.cluster_id = c.cluster_id";
+        $genome_acc = &DB_connect::very_first_result_sql($dbproc, $query);
+    }
 
     ## get the alignment segment coordinates
-    $query = "select ci.id, ci.length, ci.cdna_acc, ci.is_fli, "
+    my $query = "select ci.id, ci.length, ci.cdna_acc, ci.is_fli, "
         . " ci.header, a.lend, a.rend, a.mlend, a.mrend, a.orient, "
         . " al.aligned_orient, al.spliced_orient, al.validate, al.prog, al.align_acc, a.per_id "
         . " from alignment a, cdna_info ci, align_link al "
         . " where a.align_id = $align_id and a.align_id = al.align_id "
         . " and al.cdna_info_id = ci.id ";
-    
+
     my @results = &DB_connect::do_sql_2D ($dbproc, $query);
+
+    return (&_create_alignment_obj_from_rows(\@results, $align_id, $seq_ref, $genome_acc));
+}
+
+
+####
+## Bulk version of create_alignment_obj(): fetches all segment rows for a list
+## of align_ids in one query per chunk instead of two queries per alignment.
+## align_link.align_id is the primary key (== rowid), and alignment.feat_id is
+## the rowid alias, so "order by al.align_id, a.feat_id" reproduces the segment
+## order of the per-alignment query exactly.
+## Returns a hashref mapping align_id => CDNA::CDNA_alignment object.
+sub create_alignment_objs_bulk {
+    my ($dbproc, $align_ids_aref, $genome_acc, $seq_ref) = @_;
+
+    my %align_id_to_obj;
+    my @align_ids = @$align_ids_aref;
+    return (\%align_id_to_obj) unless (@align_ids);
+
+    my $CHUNK_SIZE = 500; ## stay well under sqlite's max variable number limit
+    for (my $i = 0; $i <= $#align_ids; $i += $CHUNK_SIZE) {
+        my $end = $i + $CHUNK_SIZE - 1;
+        $end = $#align_ids if ($end > $#align_ids);
+        my $in_list = join(",", @align_ids[$i..$end]);
+
+        my $query = "select al.align_id, ci.id, ci.length, ci.cdna_acc, ci.is_fli, "
+            . " ci.header, a.lend, a.rend, a.mlend, a.mrend, a.orient, "
+            . " al.aligned_orient, al.spliced_orient, al.validate, al.prog, al.align_acc, a.per_id "
+            . " from alignment a, cdna_info ci, align_link al "
+            . " where a.align_id = al.align_id and al.cdna_info_id = ci.id "
+            . " and al.align_id in ($in_list) "
+            . " order by al.align_id, a.feat_id";
+
+        my @results = &DB_connect::do_sql_2D($dbproc, $query);
+
+        my $curr_align_id = undef;
+        my @curr_rows;
+        foreach my $row (@results) {
+            my $align_id = shift @$row;
+            if (defined($curr_align_id) && $align_id != $curr_align_id) {
+                $align_id_to_obj{$curr_align_id} = &_create_alignment_obj_from_rows(\@curr_rows, $curr_align_id, $seq_ref, $genome_acc);
+                @curr_rows = ();
+            }
+            $curr_align_id = $align_id;
+            push (@curr_rows, $row);
+        }
+        if (defined $curr_align_id) {
+            $align_id_to_obj{$curr_align_id} = &_create_alignment_obj_from_rows(\@curr_rows, $curr_align_id, $seq_ref, $genome_acc);
+        }
+    }
+
+    return (\%align_id_to_obj);
+}
+
+
+####
+## Bulk version of get_alignment_obj_via_align_acc(); one query per chunk
+## instead of three queries per accession.  align_id chosen per accession via
+## min(align_id), which matches the first-row semantics of
+## get_align_id_via_align_acc() (align_id is align_link's primary key/rowid).
+## Returns a listref of alignment objects in the same order as the input accs.
+sub get_alignment_objs_via_align_accs {
+    my ($dbproc, $align_accs_aref, $seqref, $genome_acc) = @_;
+
+    my @accs = @$align_accs_aref;
+    return ([]) unless (@accs);
+
+    my $dbh = $dbproc->{dbh};
+    my %acc_to_align_id;
+    my @align_ids;
+
+    my $CHUNK_SIZE = 500;
+    for (my $i = 0; $i <= $#accs; $i += $CHUNK_SIZE) {
+        my $end = $i + $CHUNK_SIZE - 1;
+        $end = $#accs if ($end > $#accs);
+        my $in_list = join(",", map { $dbh->quote($_) } @accs[$i..$end]);
+
+        my $query = "select align_acc, min(align_id) from align_link where align_acc in ($in_list) group by align_acc";
+        my @results = &DB_connect::do_sql_2D($dbproc, $query);
+        foreach my $result (@results) {
+            my ($align_acc, $align_id) = @$result;
+            unless (defined $acc_to_align_id{$align_acc}) {
+                push (@align_ids, $align_id);
+            }
+            $acc_to_align_id{$align_acc} = $align_id;
+        }
+    }
+
+    my $align_objs_href = &create_alignment_objs_bulk($dbproc, \@align_ids, $genome_acc, $seqref);
+
+    my @alignment_objs;
+    foreach my $acc (@accs) {
+        my $align_id = $acc_to_align_id{$acc};
+        unless (defined $align_id) {
+            confess "Error, no align_id returned for align_acc: $acc";
+        }
+        my $alignment_obj = $align_objs_href->{$align_id};
+        unless ($alignment_obj) {
+            confess "Error, no alignment obj built for align_acc: $acc (align_id: $align_id)";
+        }
+        push (@alignment_objs, $alignment_obj);
+    }
+
+    return (\@alignment_objs);
+}
+
+
+####
+## Shared object-construction logic for create_alignment_obj() and the bulk
+## variants above.  @$results_aref holds the segment rows (column order as in
+## the queries above) for a single align_id.
+sub _create_alignment_obj_from_rows {
+    my ($results_aref, $align_id, $seq_ref, $genome_acc) = @_;
+
     my @alignment_segments;
     my $cdna_length;
     my $Cdna_acc,
@@ -68,7 +183,7 @@ sub create_alignment_obj {
     my $validation_status = 0;
     my $Cdna_id = undef;
     my $Prog;
-    foreach my $result (@results) {
+    foreach my $result (@$results_aref) {
         my ($cdna_id, $length, $acc, $is_fli_status, $header, $lend, $rend, $mlend, $mrend, $orient, $aligned_orient, $spliced_orient, $validate, $prog, $align_acc, $per_id) = @$result;
         $cdna_length = $length;
         $Cdna_acc = $acc;

@@ -230,21 +230,29 @@ sub assemble_transcripts_on_scaffold {
         }
 
         my @alignments;
-        foreach my $result (@results) {
-            my ($cdna_acc, $align_id, $align_lend, $score) = @$result;
-            print "cdna_acc: $cdna_acc\talign_id: $align_id\n" if $SEE;
+        if (@results) {
+            ## Bulk-fetch all alignment objects for the cluster in one query
+            ## per 500 alignments instead of two queries per alignment.
+            my @align_ids = map { $_->[1] } @results;
+            my $align_objs_href = &Ath1_cdnas::create_alignment_objs_bulk($dbproc, \@align_ids, $asmbl_id, \$sequence);
 
-            my $alignment_obj = &Ath1_cdnas::create_alignment_obj($dbproc, $align_id, \$sequence);
-            $alignment_obj->set_acc($cdna_acc);
-            my $aligned_orient = $alignment_obj->get_orientation();
-            my $spliced_orient = $alignment_obj->get_spliced_orientation();
-            print "$cdna_acc (a$aligned_orient, s$spliced_orient)\n" if $SEE;
-            unless ($aligned_orient =~ /[\+\-]/) {
-                die "Error, $cdna_acc lacs aligned orient!";
+            foreach my $result (@results) {
+                my ($cdna_acc, $align_id, $align_lend, $score) = @$result;
+                print "cdna_acc: $cdna_acc\talign_id: $align_id\n" if $SEE;
+
+                my $alignment_obj = $align_objs_href->{$align_id}
+                    or die "Error, no alignment obj built for align_id: $align_id";
+                $alignment_obj->set_acc($cdna_acc);
+                my $aligned_orient = $alignment_obj->get_orientation();
+                my $spliced_orient = $alignment_obj->get_spliced_orientation();
+                print "$cdna_acc (a$aligned_orient, s$spliced_orient)\n" if $SEE;
+                unless ($aligned_orient =~ /[\+\-]/) {
+                    die "Error, $cdna_acc lacs aligned orient!";
+                }
+
+                print $alignment_obj->toToken() . "\n" if $SEE;
+                push (@alignments, $alignment_obj);
             }
-
-            print $alignment_obj->toToken() . "\n" if $SEE;
-            push (@alignments, $alignment_obj);
         }
 
         if (@alignments) {
@@ -330,7 +338,9 @@ sub select_aligns_to_assemble {
         }
         
         my %bins_to_delete;
-        
+
+        ## numeric sort for deterministic sampling order (hash key order is
+        ## randomized per process, and the sampled set feeds the assemblies).
         foreach my $bin (sort {$a<=>$b} keys %bin_to_align) {
             
             my $list_aref = $bin_to_align{$bin};

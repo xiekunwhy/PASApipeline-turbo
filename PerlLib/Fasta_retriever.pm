@@ -109,13 +109,14 @@ sub get_seq {
                 print STDERR "   reached $_, stopping\n" if $DEBUG;
                 last;
             }
+            ## strip whitespace per line: a single tr pass during reading is
+            ## much cheaper than a s/\s+//g over a whole chromosome afterwards
+            tr/ \t\r\n//d;
             $seq .= $_;
         }
         print STDERR "-done seeking $acc\n\n" if $DEBUG;
     }
-    
-    $seq =~ s/\s+//g;
-        
+
     return($seq);
 }
     
