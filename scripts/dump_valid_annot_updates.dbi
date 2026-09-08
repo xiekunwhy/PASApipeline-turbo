@@ -303,11 +303,12 @@ if ($FULL_RELEASE) {
 
 
 ## report the full release:
-foreach my $asmbl_id (keys %contig_id_to_gene_IDs) {
-  
+## (sorted: output line order must not depend on randomized hash order)
+foreach my $asmbl_id (sort keys %contig_id_to_gene_IDs) {
+
   my $genome_sequence = cdbyank_linear($asmbl_id, $genome_db);
-  
-  my @gene_ids = keys %{$contig_id_to_gene_IDs{$asmbl_id}};
+
+  my @gene_ids = sort keys %{$contig_id_to_gene_IDs{$asmbl_id}};
   
   unless (@gene_ids) {
 	die "Error, no gene_ids reproted for contig $asmbl_id";

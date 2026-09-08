@@ -48,11 +48,21 @@ sub build_clusters {
     }
 
     my %clusters;
-    foreach my $elem (keys %parent) {
+    ## sort keys: deterministic member order within each cluster
+    ## (hash iteration order is randomized per process)
+    foreach my $elem (sort keys %parent) {
         push (@{$clusters{$find->($elem)}}, $elem);
     }
 
-    return (values %clusters);
+    ## deterministic cluster order: sort by first member
+    ## (numeric-aware so numeric ids sort naturally)
+    my @clusters = sort {
+        ($a->[0] =~ /^\d+$/ && $b->[0] =~ /^\d+$/)
+            ? ($a->[0] <=> $b->[0])
+            : ($a->[0] cmp $b->[0])
+    } values %clusters;
+
+    return (@clusters);
 }
 
 

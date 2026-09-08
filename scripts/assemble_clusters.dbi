@@ -331,7 +331,7 @@ sub select_aligns_to_assemble {
         
         my %bins_to_delete;
         
-        foreach my $bin (keys %bin_to_align) {
+        foreach my $bin (sort {$a<=>$b} keys %bin_to_align) {
             
             my $list_aref = $bin_to_align{$bin};
             my $struct = shift @$list_aref;

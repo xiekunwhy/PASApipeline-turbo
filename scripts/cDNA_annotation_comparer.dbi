@@ -2454,7 +2454,7 @@ sub incorporate_incompatible_nonFL_alignments_via_stitching {
         my $have_flcdna_stitched = 0;
         my $stitched_available_gene_needs_new_isoform = 0; ## Flag for those cases where the assembly stitches fine into a gene model, but remains incompatible with previously merged EST assemblies.
         
-        foreach my $model_feat_name (@$available_gene_models_aref, keys %$fl_updated_genemodels_href) {
+        foreach my $model_feat_name (@$available_gene_models_aref, sort keys %$fl_updated_genemodels_href) {
             ## Examine the models w/o FL-cdna support first.
             ## Also, available_gene_models are targeted for updates
             ## Stitched FL-cDNAs provide alternative splicing isoforms, not updates to existing genes.
@@ -2637,7 +2637,7 @@ sub incorporate_incompatible_nonFL_alignments_via_STOMPING {
                 }
             }
             
-            foreach my $model_feat_name (@models_no_transcript_support, keys %$fl_updated_genemodels_href, @models_transcript_support) { #prioritized list
+            foreach my $model_feat_name (@models_no_transcript_support, sort keys %$fl_updated_genemodels_href, @models_transcript_support) { #prioritized list
                 
                 my $has_transcript_support = 0; #init
                 

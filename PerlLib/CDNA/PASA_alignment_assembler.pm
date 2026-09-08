@@ -179,7 +179,7 @@ sub assemble_alignments {
         $assembly->set_spliced_orientation($spliced_orient);
         if ($spliced_orient eq '?') {
             ## set aligned orientation based on a majority vote
-            my @orients = reverse sort { $aligned_orient_counts{$a} <=> $aligned_orient_counts{$b} } keys %aligned_orient_counts;
+            my @orients = sort { $aligned_orient_counts{$b} <=> $aligned_orient_counts{$a} || $a cmp $b } keys %aligned_orient_counts;
             my $winning_aligned_orient = shift @orients;
             $assembly->set_orientation($winning_aligned_orient);
         }

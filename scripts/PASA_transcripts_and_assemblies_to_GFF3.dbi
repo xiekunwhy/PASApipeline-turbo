@@ -201,7 +201,7 @@ $dbproc->disconnect;
 
 if ($BED_FORMAT) {
 	
-	foreach my $alignment_acc (keys %ALIGNMENTS) {
+	foreach my $alignment_acc (sort keys %ALIGNMENTS) {
 		my ($asmbl_id, $transcript_id, $align_acc) = split(/$;/, $alignment_acc);
 
 

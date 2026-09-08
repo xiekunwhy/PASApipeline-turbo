@@ -117,7 +117,10 @@ my %align_span;
 }
 print STDERR "// done prefetching alignment spans.\n";
 
-foreach my $asmbl_id_info (keys %asmbl_id_to_cdna_accs) {
+## sort the hash keys: new cluster_ids are assigned in processing order, and
+## hash iteration order is randomized per process.  Sorting keeps the cluster
+## numbering deterministic across runs (same input => same output).
+foreach my $asmbl_id_info (sort keys %asmbl_id_to_cdna_accs) {
     
 	my ($asmbl_id, $spliced_orient) = split(/;/, $asmbl_id_info);
 
@@ -250,7 +253,7 @@ foreach my $asmbl_id_info (keys %asmbl_id_to_cdna_accs) {
     }
         
     unless ($DEBUG) {
-        foreach my $acc (keys %acc_to_struct) {
+        foreach my $acc (sort keys %acc_to_struct) {
             unless ($seen{$acc}) {
                 &insert_cluster($dbproc, $asmbl_id, [$acc], \%acc_to_struct);
             }

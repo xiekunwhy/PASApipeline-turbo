@@ -215,7 +215,7 @@ sub store_cluster_links {
 
     print "\n\nStoring cluster links.\n\n";
     
-    foreach my $asmbl_id (keys %$asmbl_to_acc_href) {
+    foreach my $asmbl_id (sort keys %$asmbl_to_acc_href) {
         my @accs = keys %{$asmbl_to_acc_href->{$asmbl_id}};
 
         ## install row in clusters table
