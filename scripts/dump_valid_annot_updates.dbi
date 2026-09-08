@@ -120,6 +120,14 @@ foreach my $result (@results) {
 my $temp_model_id = 0;
 my $temp_gene_id = 0;
 
+## fallback IDs (temp_gene_N / temp_model_N) are handed out per dump run;
+## tag them with the db (chromosome) name so per-chromosome dumps stay unique
+## when merged genome-wide, and deterministic across re-runs.
+my $db_tag = $MYSQLdb;
+$db_tag =~ s{.*/}{};      # basename
+$db_tag =~ s{\..*$}{};    # strip extension (ie. Chr1.polishing_PASA.sqlite -> Chr1)
+$db_tag =~ s/\W/_/g;
+
 # get tentative (or actual) updates
 my $query = "select update_id, gene_id, model_id, alt_splice_flag, is_novel_flag, after_gene_obj, is_valid "
     . " from annotation_updates "
@@ -165,13 +173,13 @@ foreach my $result (@results) {
 	  $gene_id =~ s/ /_/g;
 	}
 	else {
-	  $gene_id = "temp_gene_" . ++ $temp_gene_id;
+	  $gene_id = "temp_gene_" . ++ $temp_gene_id . "_" . $db_tag;
     }
 	if ($model_id) {
 	  $model_id =~ s/ /_/g;
-	} 
+	}
 	else {
-	  $model_id = "temp_model_" . ++$temp_model_id;
+	  $model_id = "temp_model_" . ++$temp_model_id . "_" . $db_tag;
     }
         
     ## get the pasa accs responsible for the update

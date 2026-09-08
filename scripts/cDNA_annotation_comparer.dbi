@@ -2736,7 +2736,11 @@ sub stitch_nonFL_alignments_into_FL_alignments {
             if ($valid) {
                 $alignment_wrapper->{is_valid} = 1;
                 $alignment_wrapper->{status} = 27; # EST-assembly stitched into a FL-alignment providing new alt splice isoform.
-                $alignment_wrapper->{annotated_model_identifier} = 0;
+                ## give it a real (deterministic, contig-tagged) model id
+                $NOVEL_MODEL_COUNTER{$current_contig}++;
+                my $id_tag = ($MULTI_CONTIG) ? "${NOVEL_GENE_TOKEN}_${current_contig}" : $NOVEL_GENE_TOKEN;
+                $id_tag =~ s/\W/_/g;
+                $alignment_wrapper->{annotated_model_identifier} = "novel_model_" . $NOVEL_MODEL_COUNTER{$current_contig} . "_${id_tag}";
                 last;
             } else {
                 $alignment_wrapper->{is_valid} = 0;
