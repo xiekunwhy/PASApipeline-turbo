@@ -42,7 +42,7 @@
 
 ### 性能（第四轮：注释更新导出，NYTProf 实测驱动）
 
-第 1–3 轮之后，`dump_valid_annot_updates.dbi`（`update_pasa.pl` step05 的导出步骤）成为下一个瓶颈。
+第 1–3 轮之后，`dump_valid_annot_updates.dbi` 成为下一个瓶颈。
 
 - **批量 SQL 取代 N+1 查询**：原来每个 valid update 查一次 `status_link`、每个 model 查一次 `annotation_store` 取基因对象（model 列表本身还被原样查了两次）；现在改为开头一次性两条批量查询，`get_orig_gene_obj()` 直接从预加载的 map 里解冻（同一 model 仍取首行）。Chr6 库上语句执行次数从约 1.5 万降到 6。行序完全保持：status_link 批量查询按 `annot_update_id, status_link_id` 排序，确定性复现原来走 updateididx 索引的返回顺序；FULL_RELEASE 遍历时按原查询返回顺序迭代 store 行，同一基因下 isoform 的输出顺序不变。
 - **更快的翻译核心**（`PerlLib/Nuc_translator.pm`）：`_translate_sequence_uncached()` 只遍历完整密码子，每个密码子一次哈希查询（原来是每密码子 exists+fetch 两次查询外加长度判断）。实测 unpack+map 向量化方案反而比循环慢，所以保留循环结构。核心提速约 2.1 倍（7000 条随机 CDS，perl 5.38）；等价性经 2.6 万例混合字母表模糊测试（含 N/U/小写、长度 mod 3、frame 1-6、undef 边界）及第三轮测试验证。
