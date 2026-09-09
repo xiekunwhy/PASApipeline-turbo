@@ -385,15 +385,18 @@ sub process_contig {
 
     my ($dbproc_t) = &DB_connect::connect_to_db($MYSQLserver,$MYSQLdb,$user,$password);
 
-    ## Wrap the whole contig's comparison writes in one transaction:
-    ## per-statement autocommit costs real time at ~100k statements/contig,
-    ## and a failure rolls back cleanly (the run dies on thread failure anyway).
+    ## Wrap the whole contig's comparison writes in one transaction - but only
+    ## when this run is single-contig (single thread, no contention).  On a
+    ## multi-contig database the contig threads write concurrently to the same
+    ## SQLite file and a long-lived transaction would lock out the other
+    ## threads' reads ("database is locked"); those runs use the default
+    ## per-statement autocommit, serialized by the global DB lock.
     my $in_transaction = 0;
-    if ($dbproc_t->{dbh}->{Driver}->{Name} eq 'SQLite') {
+    if (!$MULTI_CONTIG && $dbproc_t->{dbh}->{Driver}->{Name} eq 'SQLite') {
         $dbproc_t->{dbh}->begin_work;
         $in_transaction = 1;
     }
-    
+
     my $contig_id = $asmbl_id; #should probably use contig_id rather than asmbl_id (our database field)
     print "## Processing contig: $asmbl_id\n";
     
