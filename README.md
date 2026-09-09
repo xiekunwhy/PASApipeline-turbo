@@ -52,8 +52,8 @@ Chromosome Chr6 of a *Fragaria* genome, updated with 187,797 StringTie+GeMoSeq e
 
 | step | stock | turbo | speedup |
 |---|---|---|---|
-| step04 assembly (`assemble_clusters.dbi`) | 103 s | 39 s | 2.7× |
-| step05 annotation comparison (`cDNA_annotation_comparer.dbi`) | 318 s | ~200 s | 1.6× |
+| assembly (`assemble_clusters.dbi`) | 103 s | 39 s | 2.7× |
+| annotation comparison (`cDNA_annotation_comparer.dbi`) | 318 s | ~200 s | 1.6× |
 
 Outputs are byte-identical to the stock code (assemblies GFF3, updated GFF3, full database content), verified by repeated A/B runs plus an 18,000-case fuzz test of the pure-Perl pair assembler against the real `pasa` binary.
 
