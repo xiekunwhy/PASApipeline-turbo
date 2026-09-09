@@ -40,6 +40,15 @@
 - **不再重复算 ORF**：`validate_FLcdna_inferred_geneObjs` 原来对同一比对重复计算两次完全相同的 ORF；现在复用第一次结果。
 - **批量 + 预处理写库**（`cDNA_annotation_comparer.dbi`、`PerlLib/DB_connect.pm`）：`status_link` / `annotation_link` 改成 150 行一条的多行 INSERT；comparer 的热点 SELECT/INSERT 走按连接缓存的预处理语句；单 contig 的比较写入包进一个事务（多 contig 库上不启用——见"稳健性"）。
 
+### 性能（第四轮：注释更新导出，NYTProf 实测驱动）
+
+第 1–3 轮之后，`dump_valid_annot_updates.dbi`（`update_pasa.pl` step05 的导出步骤）成为下一个瓶颈。
+
+- **批量 SQL 取代 N+1 查询**：原来每个 valid update 查一次 `status_link`、每个 model 查一次 `annotation_store` 取基因对象（model 列表本身还被原样查了两次）；现在改为开头一次性两条批量查询，`get_orig_gene_obj()` 直接从预加载的 map 里解冻（同一 model 仍取首行）。Chr6 库上语句执行次数从约 1.5 万降到 6。行序完全保持：status_link 批量查询按 `annot_update_id, status_link_id` 排序，确定性复现原来走 updateididx 索引的返回顺序；FULL_RELEASE 遍历时按原查询返回顺序迭代 store 行，同一基因下 isoform 的输出顺序不变。
+- **更快的翻译核心**（`PerlLib/Nuc_translator.pm`）：`_translate_sequence_uncached()` 只遍历完整密码子，每个密码子一次哈希查询（原来是每密码子 exists+fetch 两次查询外加长度判断）。实测 unpack+map 向量化方案反而比循环慢，所以保留循环结构。核心提速约 2.1 倍（7000 条随机 CDS，perl 5.38）；等价性经 2.6 万例混合字母表模糊测试（含 N/U/小写、长度 mod 3、frame 1-6、undef 边界）及第三轮测试验证。
+- **只构建蛋白序列**：导出阶段原来经 `create_all_sequence_types()` 为每个 isoform 构建 cDNA+CDS+蛋白，但实际只打印 `#PROT` 行；现在每个 isoform 只构建 CDS+蛋白（同样的编码基因判断，同样先用基因组重算 CDS 再翻译，语义完全一致）。
+- **不再每 contig 起进程**：`cdbyank_linear()`（每个 contig 起一个外部 `cdbyank` 进程）换成单个复用的 `Fasta_retriever`（有 `.fai` 索引就直接用）——单染色体库上差别不大，几千个 scaffold 的库上收益显著。
+
 ### 真实数据实测
 
 *Fragaria*（草莓属）基因组 Chr6 染色体，用 187,797 条 StringTie+GeMoSeq 证据转录本更新（WSL2，8 线程）：
@@ -48,8 +57,9 @@
 |---|---|---|---|
 | 装配（`assemble_clusters.dbi`） | 103 s | 39 s | 2.7× |
 | 注释比较（`cDNA_annotation_comparer.dbi`） | 318 s | 约 200 s | 1.6× |
+| 更新导出（`dump_valid_annot_updates.dbi -V -R`） | 8.3 s | 2.0 s | 4.2× |
 
-输出与原版代码逐字节一致（装配 GFF3、更新 GFF3、数据库全量内容），经多轮 A/B 重复运行验证，外加用真实 `pasa` 二进制对纯 Perl 成对装配器做的 18,000 例模糊测试（零不一致）。
+输出与原版代码逐字节一致（装配 GFF3、更新 GFF3、数据库全量内容；step05 导出的 GFF3 与 GTF 两种模式，stdout 与 stderr），经多轮 A/B 重复运行验证，外加用真实 `pasa` 二进制对纯 Perl 成对装配器做的 18,000 例模糊测试（零不一致）。
 
 ### 按染色体分片支持与唯一稳定标识符
 

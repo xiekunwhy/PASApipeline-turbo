@@ -146,19 +146,19 @@ sub _translate_sequence_uncached {
     $sequence =~ tr/T/U/;
     my $start_point = $frame - 1;
     my $protein_sequence;
-    for (my $i = $start_point; $i < $seq_length; $i+=3) {
-        my $codon = substr($sequence, $i, 3);
-        my $amino_acid;
-        if (exists($codon_table{$codon})) {
-            $amino_acid = $codon_table{$codon};
-        } else {
-            if (length($codon) == 3) {
-                $amino_acid = 'X';
-            } else {
-                $amino_acid = "";
-            }
+    my $n = $seq_length - $start_point;
+    if ($n > 0) {
+        ## Same translation as the original per-codon loop, minus its per-codon
+        ## exists()/length() checks: iterate complete codons only (the old loop
+        ## appended "" for a trailing partial codon, ie. dropped it) with a single
+        ## hash lookup per codon (table values are all truthy, so // 'X' equals the
+        ## old exists() check).  Measured ~2x faster than the original loop (an
+        ## unpack+map variant benchmarked slower than the loop).
+        $protein_sequence = "";
+        my $last = $start_point + $n - ($n % 3);
+        for (my $i = $start_point; $i < $last; $i += 3) {
+            $protein_sequence .= ($codon_table{substr($sequence, $i, 3)} // 'X');
         }
-        $protein_sequence .= $amino_acid;
     }
     return($protein_sequence);
 }

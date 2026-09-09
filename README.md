@@ -40,6 +40,15 @@ We routinely update EVM gene models with PASA on large plant genomes, using a ch
 - **No double ORF computation**: `validate_FLcdna_inferred_geneObjs` recomputed the identical ORF for the same alignment twice; it now reuses the first result.
 - **Batched + prepared DB writes** (`cDNA_annotation_comparer.dbi`, `PerlLib/DB_connect.pm`): `status_link` / `annotation_link` are written as 150-row multi-INSERTs; the comparer's hot SELECTs/INSERTs go through per-connection prepared-statement caching; each single-contig comparison's writes are wrapped in one transaction (disabled on multi-contig databases — see Robustness).
 
+### Performance, round 4 (annotation-update dump, NYTProf-profiled)
+
+`dump_valid_annot_updates.dbi` (the `update_pasa.pl` step05 dump) was the next bottleneck after rounds 1-3.
+
+- **Bulk SQL instead of N+1 queries**: the per-update `status_link` query (one per valid update) and the per-model `annotation_store` gene-object fetches (one per model; the model list itself was also queried twice) are replaced by two bulk queries issued once up front; `get_orig_gene_obj()` thaws from the preloaded map (first row per model, as before). Statement executions drop from ~15k to 6 on the Chr6 database. Row order is preserved exactly: the bulk status_link query orders by `annot_update_id, status_link_id`, reproducing the old per-update index-scan order, and the FULL_RELEASE pass iterates the store rows in original query-return order so per-gene isoform order is unchanged.
+- **Faster translation core** (`PerlLib/Nuc_translator.pm`): `_translate_sequence_uncached()` iterates complete codons only and does a single hash lookup per codon (was exists()+fetch plus a length check per codon). An unpack+map vectorization benchmarked *slower* than the loop, so the loop stays. ~2.1× faster core (7000 random CDS, perl 5.38); equivalence fuzzed on 26k mixed-alphabet cases (N/U/lowercase, lengths mod 3, frames 1-6, undef edges) plus the round-3 test.
+- **Protein-only sequence building**: the dump's output phase built cDNA+CDS+protein per isoform via `create_all_sequence_types()` but only prints `#PROT` lines; it now builds just CDS+protein per isoform (same coding-gene guard, CDS recomputed from the genome before translation, exactly as before).
+- **No per-contig process spawn**: `cdbyank_linear()` (one external `cdbyank` process per contig) is replaced by a single `Fasta_retriever` on the genome fasta (uses the `.fai` index when present) — negligible on single-chromosome databases, significant on multi-thousand-scaffold ones.
+
 ### Per-chromosome sharding support and unique, stable identifiers
 
 - `assembly_db_loader.dbi`: assembly IDs carry the db (chromosome) tag — `asmbl_Chr1_1` — so per-chromosome assembly files merge without collisions.
@@ -54,8 +63,9 @@ Chromosome Chr6 of a *Fragaria* genome, updated with 187,797 StringTie+GeMoSeq e
 |---|---|---|---|
 | assembly (`assemble_clusters.dbi`) | 103 s | 39 s | 2.7× |
 | annotation comparison (`cDNA_annotation_comparer.dbi`) | 318 s | ~200 s | 1.6× |
+| update dump (`dump_valid_annot_updates.dbi -V -R`) | 8.3 s | 2.0 s | 4.2× |
 
-Outputs are byte-identical to the stock code (assemblies GFF3, updated GFF3, full database content), verified by repeated A/B runs plus an 18,000-case fuzz test of the pure-Perl pair assembler against the real `pasa` binary.
+Outputs are byte-identical to the stock code (assemblies GFF3, updated GFF3, full database content; step05 dump in GFF3 and GTF modes, stdout and stderr), verified by repeated A/B runs plus an 18,000-case fuzz test of the pure-Perl pair assembler against the real `pasa` binary.
 
 ### Robustness
 

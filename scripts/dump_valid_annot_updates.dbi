@@ -13,7 +13,7 @@ use Getopt::Long qw(:config no_ignore_case bundling);
 use Gene_obj;
 use Storable ("thaw");
 use Data::Dumper;
-use CdbTools;
+use Fasta_retriever;
 
 use vars qw ($opt_M $opt_C $opt_V $opt_d $opt_h $opt_v $opt_R $GTF $genome_db);
 
@@ -97,12 +97,29 @@ my $query = "select annotation_version from annotation_compare where compare_id 
 my $annotation_version = &very_first_result_sql($dbproc, $query);
 
 
+## Bulk-load the annotation_store rows for this annotation version exactly once:
+## - %model_to_frozen: model_id => frozen gene_obj blob; first row wins, mirroring the
+##   very_first_result_sql semantics of the former per-model query in get_orig_gene_obj()
+## - @model_ids_in_order: model_ids in query return order; backs %prev_model_ids below
+##   and the FULL_RELEASE pass, whose per-gene isoform push order must match the
+##   original query-returned order.
+## Same table/WHERE and no ORDER BY as the original "select model_id ..." queries,
+## so SQLite uses the same query plan and row order.
+my $query = "select model_id, gene_obj from annotation_store where annotation_version = $annotation_version";
+my %model_to_frozen;
+my @model_ids_in_order;
+{
+    my @store_rows = &do_sql_2D($dbproc, $query);
+    foreach my $row (@store_rows) {
+        my ($model_id, $gene_obj_blob) = @$row;
+        push (@model_ids_in_order, $model_id);
+        $model_to_frozen{$model_id} //= $gene_obj_blob;
+    }
+}
+
 ## get list of all previous model identifiers so that we do not reuse them w/ new alt-splice isoforms
-my $query = "select model_id from annotation_store where annotation_version = $annotation_version";
 my %prev_model_ids;
-my @results = &do_sql_2D($dbproc, $query);
-foreach my $result (@results) {
-  my ($model_id) = @$result;
+foreach my $model_id (@model_ids_in_order) {
   $prev_model_ids{$model_id} = 1;
 }
 
@@ -138,6 +155,25 @@ if ($VALID_ONLY) {
 
 my %models_updated;
 my %model_counter;
+
+
+## Bulk-load the status_link rows of all this comparison's updates in one query.
+## The former per-update query had no ORDER BY; SQLite resolves it via the
+## updateididx index, returning each update's rows in rowid (=status_link_id) order.
+## ORDER BY annot_update_id, status_link_id reproduces that order deterministically.
+my %update_id_to_status_info;
+{
+    my $status_query = "select sl.annot_update_id, sl.cdna_acc, sl.status_id "
+        . " from status_link sl, status s "
+        . " where sl.status_id = s.status_id "
+        . " and sl.annot_update_id in (select update_id from annotation_updates where compare_id = $compare_id) "
+        . " order by sl.annot_update_id, sl.status_link_id";
+    my @status_rows = &do_sql_2D($dbproc, $status_query);
+    foreach my $row (@status_rows) {
+        my ($annot_update_id, $cdna_acc, $status_id) = @$row;
+        push (@{$update_id_to_status_info{$annot_update_id}}, [$cdna_acc, $status_id]);
+    }
+}
 
 
 
@@ -182,11 +218,11 @@ foreach my $result (@results) {
 	  $model_id = "temp_model_" . ++$temp_model_id . "_" . $db_tag;
     }
         
-    ## get the pasa accs responsible for the update
-    my $query = "select sl.cdna_acc, sl.status_id "
-        . " from status_link sl, status s "
-        . " where sl.status_id = s.status_id and sl.annot_update_id = $update_id";
-    my @results = &do_sql_2D($dbproc, $query);
+    ## get the pasa accs responsible for the update (bulk-loaded above)
+    my @results;
+    if (my $status_rows = $update_id_to_status_info{$update_id}) {
+        @results = @$status_rows;
+    }
     
     unless (@results) {
         print STDERR "** ERROR, no accs found linked to update $update_id\n";
@@ -282,10 +318,9 @@ foreach my $result (@results) {
 
 
 if ($FULL_RELEASE) {
-	my $query = "select model_id from annotation_store where annotation_version = $annotation_version";
-	my @results = &do_sql_2D($dbproc, $query);
-	foreach my $result (@results) {
-		my $model_id = $result->[0];
+	## iterate the bulk-loaded model list in the original query-return order;
+	## push order into %gene_id_to_gene_objs determines isoform order in output.
+	foreach my $model_id (@model_ids_in_order) {
 		unless ($models_updated{$model_id}) {
 			
 			my $gene_obj = &get_orig_gene_obj($model_id, $annotation_version);
@@ -304,9 +339,11 @@ if ($FULL_RELEASE) {
 
 ## report the full release:
 ## (sorted: output line order must not depend on randomized hash order)
+my $fasta_retriever = new Fasta_retriever($genome_db);
+
 foreach my $asmbl_id (sort keys %contig_id_to_gene_IDs) {
 
-  my $genome_sequence = cdbyank_linear($asmbl_id, $genome_db);
+  my $genome_sequence = $fasta_retriever->get_seq($asmbl_id);
 
   my @gene_ids = sort keys %{$contig_id_to_gene_IDs{$asmbl_id}};
   
@@ -352,8 +389,14 @@ foreach my $asmbl_id (sort keys %contig_id_to_gene_IDs) {
 	  print $gene_obj->to_GFF3_format() . "\n\n";
 	}
 	
-	$gene_obj->create_all_sequence_types(\$genome_sequence);
+	## Only the protein sequence is reported below.  Build CDS+protein per isoform
+	## exactly as create_all_sequence_types does for coding genes (CDS recomputed
+	## from this genome first, then translated), skipping the cDNA/gene sequences.
 	foreach my $isoform ($gene_obj, $gene_obj->get_additional_isoforms()) {
+	  if ($isoform->is_coding_gene()) {
+	    $isoform->create_CDS_sequence(\$genome_sequence);
+	    $isoform->create_protein_sequence(\$genome_sequence);
+	  }
 	  my $protein = $isoform->get_protein_sequence();
 	  my $model_id = $isoform->{Model_feat_name};
 	  my $gene_id = $isoform->{TU_feat_name};
@@ -370,11 +413,9 @@ exit(0);
 sub get_orig_gene_obj {
 	my ($model_id, $annot_version) = @_;
 	
-	my $query = qq { select gene_obj from annotation_store 
-                                 where annotation_version = $annotation_version 
-                                 and model_id = "$model_id"
-                             };
-	my $gene_obj_blob = &very_first_result_sql($dbproc, $query);
+	## served from the bulk-loaded map (annotation_store was fetched once up front);
+	## no per-model SQL round trip anymore.
+	my $gene_obj_blob = $model_to_frozen{$model_id};
 	my $gene_obj = thaw($gene_obj_blob);
 
 	return($gene_obj);
