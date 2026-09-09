@@ -1,5 +1,7 @@
 # PASApipeline-turbo
 
+**[中文说明见 README_cn.md](README_cn.md)**
+
 A performance- and robustness-oriented fork of [PASApipeline](https://github.com/PASApipeline/PASApipeline), developed for chromosome-sharded, SQLite-backed annotation updates on large eukaryotic genomes.
 
 Base: upstream master @ `cc1f8d7` (v2.5.3 + 2 commits). License and copyright remain with the Broad Institute (BSD 3-Clause, see [LICENSE](LICENSE)).
@@ -31,22 +33,48 @@ We routinely update EVM gene models with PASA on large plant genomes, using a ch
 - **Sequence computation once per gene object**: `compare_updated_proteins()` skips `create_all_sequence_types()` when the object's protein/cDNA/CDS sequences are already computed (the same annotated model is compared against many assemblies).
 - **Other**: previously-incorporated EST alignments are cached instead of re-fetched per stitching attempt; FL-inferred gene objects in `stitch_nonFL_alignments_into_FL_alignments` are computed once per FL-cDNA instead of per (EST × FL) pair; subcluster listings are cached across the two comparer passes; `DB_connect::get_last_insert_id()` uses the driver-native call instead of an extra SELECT round-trip; `Fasta_retriever::get_seq()` strips whitespace per line while reading instead of a second full pass over chromosome-length strings.
 
+### Performance, round 3 (annotation comparer, NYTProf-profiled)
+
+- **ORF scanning** (`PerlLib/Longest_orf.pm`): `get_orfs()` used to scan all (start × stop) position pairs per sequence; it now binary-searches the first stop past each start codon (identical picks, verified on 8000 random sequences).
+- **Translation memoization** (`PerlLib/Nuc_translator.pm`): `translate_sequence()` / `get_protein()` are memoized per exact sequence (size-capped, cleared on genetic-code change) — the same CDS sequences recur across the many assemblies of a locus. Translation count dropped ~11× (1.98M → 176k) in the Chr6 profile, 68s → ~10s.
+- **No double ORF computation**: `validate_FLcdna_inferred_geneObjs` recomputed the identical ORF for the same alignment twice; it now reuses the first result.
+- **Batched + prepared DB writes** (`cDNA_annotation_comparer.dbi`, `PerlLib/DB_connect.pm`): `status_link` / `annotation_link` are written as 150-row multi-INSERTs; the comparer's hot SELECTs/INSERTs go through per-connection prepared-statement caching; each single-contig comparison's writes are wrapped in one transaction (disabled on multi-contig databases — see Robustness).
+
 ### Per-chromosome sharding support and unique, stable identifiers
 
 - `assembly_db_loader.dbi`: assembly IDs carry the db (chromosome) tag — `asmbl_Chr1_1` — so per-chromosome assembly files merge without collisions.
 - `cDNA_annotation_comparer.dbi`: novel gene/model IDs are deterministic and chromosome-tagged — `novel_gene_15_Chr1`, `novel_model_27_Chr1` (multi-contig databases append the contig: `novel_gene_2_others_scaf99`). Numbering uses per-contig counters; no `time()` tokens anywhere, so identical inputs give identical IDs across re-runs.
 - `dump_valid_annot_updates.dbi`: alt-splice model suffixes are deterministic incrementers (no time-based suffix).
 
+### Measured on real data
+
+Chromosome Chr6 of a *Fragaria* genome, updated with 187,797 StringTie+GeMoSeq evidence transcripts (WSL2, 8 threads):
+
+| step | stock | turbo | speedup |
+|---|---|---|---|
+| step04 assembly (`assemble_clusters.dbi`) | 103 s | 39 s | 2.7× |
+| step05 annotation comparison (`cDNA_annotation_comparer.dbi`) | 318 s | ~200 s | 1.6× |
+
+Outputs are byte-identical to the stock code (assemblies GFF3, updated GFF3, full database content), verified by repeated A/B runs plus an 18,000-case fuzz test of the pure-Perl pair assembler against the real `pasa` binary.
+
 ### Robustness
 
 - `scripts/Pasa_init.pm`: the tree's own `PerlLib` now takes precedence over `$PASAHOME/PerlLib`, so a conda-provided PASAHOME no longer shadows this installation's modules.
 - Binary discovery falls back to the tree's bundled `bin/pasa` (and `$PASAHOME/bin/fasta`) when `which` fails in batch-job environments.
 - `subcluster_loader.dbi` purges subcluster tables before loading, making re-runs idempotent.
+- **Multi-contig SQLite safety**: the annotation comparer no longer opens a long-lived transaction when the database holds more than one contig (e.g. an "others" bucket of unplaced scaffolds, or any standard single-database PASA run) — doing so locked out the other contig worker threads with `database is locked`. Single-contig databases (one worker thread) keep the transaction and its write-batching speedup.
+- **Line endings normalized to LF repository-wide** and pinned via `.gitattributes` (`* text=auto eol=lf`); CRLF in checked-out scripts breaks shebang execution on Linux (`/usr/bin/env: 'perl\r': No such file or directory`).
 - **Run-to-run determinism**: cluster IDs, assembly IDs, subcluster IDs and gff3 output order no longer depend on Perl's per-process hash randomization — `assign_clusters_by_stringent_alignment_overlap.dbi` iterates groups in sorted order, `SingleLinkageClusterer` returns members and clusters in deterministic order, `import_spliced_alignments.dbi` assigns `align_id`s in sorted contig order, and the assembly-orientation majority vote in `PASA_alignment_assembler.pm` breaks ties deterministically. Identical inputs now give byte-identical outputs across runs (upstream PASA renumbers clusters/assemblies randomly on every run).
 
 ## Compatibility
 
 Standard (single-database) runs through `Launch_PASA_pipeline.pl` keep working; the only visible difference is that generated identifiers (assemblies, novel genes) now carry the database tag. Alignment validation thresholds and update logic are unchanged.
+
+Set `PASA_NO_PERL_PAIR_ASSEMBLY=1` to fall back to the external `pasa` binary for pairwise assemblies (the pure-Perl fast path is the default).
+
+## Testing / regression harness
+
+The fork was validated with a purpose-built harness (synthetic PASA SQLite fixtures, an 18k-case fuzz comparison of the in-process pair assembler against the compiled `pasa` binary, and a full real-data A/B run). If you modify this code, re-run an A/B comparison before shipping.
 
 ## Citation
 
