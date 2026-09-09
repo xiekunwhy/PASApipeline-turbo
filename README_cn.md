@@ -46,8 +46,8 @@
 
 | 步骤 | 原版 | turbo | 加速比 |
 |---|---|---|---|
-| step04 装配（`assemble_clusters.dbi`） | 103 s | 39 s | 2.7× |
-| step05 注释比较（`cDNA_annotation_comparer.dbi`） | 318 s | 约 200 s | 1.6× |
+| 装配（`assemble_clusters.dbi`） | 103 s | 39 s | 2.7× |
+| 注释比较（`cDNA_annotation_comparer.dbi`） | 318 s | 约 200 s | 1.6× |
 
 输出与原版代码逐字节一致（装配 GFF3、更新 GFF3、数据库全量内容），经多轮 A/B 重复运行验证，外加用真实 `pasa` 二进制对纯 Perl 成对装配器做的 18,000 例模糊测试（零不一致）。
 
